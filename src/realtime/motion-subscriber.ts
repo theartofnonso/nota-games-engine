@@ -116,7 +116,7 @@ export function subscribeToSession(sessionId: string): void {
   const stateChannel = supabase.channel(getChannelName('state', sessionId));
 
   stateChannel
-    .on('broadcast', { event: 'game_state' }, ({ payload }) => {
+    .on('broadcast', { event: 'session_state_change' }, ({ payload }) => {
       const gameState = payload as RuntimeGameState;
       updateGameState(sessionId, gameState);
     })

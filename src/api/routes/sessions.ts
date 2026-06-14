@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { supabase, supabaseForUser } from '../../lib/supabase.js';
+import { getChannelName } from '../../realtime/channels.js';
 import { subscribeToSession } from '../../realtime/motion-subscriber.js';
 import { trackPlayerPresence, untrackPlayerPresence } from '../../realtime/presence.js';
 import {
@@ -115,7 +116,7 @@ sessionsRouter.post(
     // Publish batch to the realtime motion channel.
     // The Game Engine subscriber picks this up, scores it,
     // persists to DB, and broadcasts the leaderboard update.
-    const channel = supabase.channel(`session:${sessionId}:motion`);
+    const channel = supabase.channel(getChannelName('motion', sessionId));
     const sendError = await channel.send({
       type:    'broadcast',
       event:   'motion_batch',

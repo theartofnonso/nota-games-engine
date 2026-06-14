@@ -231,7 +231,7 @@ dashboardRouter.patch(
 
       await stateChannel.send({
         type:    'broadcast',
-        event:   'game_state',
+        event:   'session_state_change',
         payload: gameState,
       });
     }

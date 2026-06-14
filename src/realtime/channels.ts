@@ -2,7 +2,6 @@ export const CHANNELS = {
   motion:   (sessionId: string) => `session:${sessionId}:motion`,
   scores:   (sessionId: string) => `session:${sessionId}:scores`,
   state:    (sessionId: string) => `session:${sessionId}:state`,
-  events:   (sessionId: string) => `session:${sessionId}:events`,
   // Dedicated channel for Presence tracking — kept separate from motion so
   // that presence callbacks (which must be registered before subscribe()) can
   // be added independently of the already-subscribed motion channel.
