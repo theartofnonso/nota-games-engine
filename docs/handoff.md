@@ -409,9 +409,15 @@ The leaderboard updates automatically after every motion batch (~5 seconds per a
 
 | Channel | Publisher | Subscribers | Events |
 |---|---|---|---|
-| session:{id}:motion | Mobile app | Game Engine | motion_batch |
-| session:{id}:scores | Game Engine | Mobile + Scoreboard | leaderboard_update, presence_update |
-| session:{id}:state | Game controller | Mobile + Scoreboard | session_state_change |
+| `session:{id}:motion` | Mobile app | Game Engine | `motion_batch` |
+| `session:{id}:scores` | Game Engine | Mobile + Scoreboard + Controller | `leaderboard_update`, `presence_update` |
+| `session:{id}:state` | Game controller | Mobile + Scoreboard + Game Engine | `session_state_change` |
+| `session:{id}:presence` | Game Engine (internal) | Game Engine only | Supabase Presence sync |
+
+> **Note:** Clients do not subscribe to `session:{id}:presence` directly.
+> The server uses it internally to track connected players via Supabase Presence.
+> Presence state is forwarded to `session:{id}:scores` as `presence_update` events,
+> which is the only channel clients need to subscribe to for both scores and presence.
 
 ---
 
