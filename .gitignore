@@ -1,0 +1,6 @@
+.env
+node_modules
+.claude
+scripts
+# ignore test files or files with the extension .test.ts
+*.test.ts

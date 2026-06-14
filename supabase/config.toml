@@ -1,0 +1,5 @@
+[api]
+enabled = true
+schemas = ["public", "graphql_public", "nota_games"]
+extra_search_path = ["public", "extensions", "nota_games"]
+max_rows = 1000
