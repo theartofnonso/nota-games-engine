@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { supabase, supabaseForUser } from '../../lib/supabase.js';
 import { getChannelName } from '../../realtime/channels.js';
+import logger from '../../lib/logger.js';
 import {
   getOrCreateSession,
   setChannel,
@@ -55,10 +56,12 @@ dashboardRouter.post(
       .single();
 
     if (error) {
+      logger.error({ err: error.message, name, teamFormat }, 'failed to create session');
       res.status(500).json({ error: 'Failed to create session', detail: error.message });
       return;
     }
 
+    logger.info({ sessionId: data.id, name, teamFormat }, 'session created');
     res.status(201).json(data);
   },
 );
@@ -135,6 +138,32 @@ dashboardRouter.post(
       duoId:      participant.duo_id  ?? null,
       joinedAt:   participant.joined_at,
     });
+  },
+);
+
+// ── GET /sessions/:id/participants ───────────────────────────────────────
+// Returns all pre-assigned participants for a session, including their
+// resolved team and duo names.  Service-role read so instructors can see
+// the full roster regardless of their own RLS scope.
+
+dashboardRouter.get(
+  '/:id/participants',
+  async (req: Request, res: Response): Promise<void> => {
+    const sessionId = req.params.id as string;
+
+    const { data, error } = await supabase
+      .schema('nota_games')
+      .from('session_participants')
+      .select('*, teams(name, color), duos(name)')
+      .eq('session_id', sessionId)
+      .order('joined_at', { ascending: true });
+
+    if (error) {
+      res.status(500).json({ error: 'Failed to fetch participants', detail: error.message });
+      return;
+    }
+
+    res.status(200).json({ sessionId, participants: data ?? [] });
   },
 );
 
@@ -234,6 +263,8 @@ dashboardRouter.patch(
         event:   'session_state_change',
         payload: gameState,
       });
+
+      logger.info({ sessionId, phase: gameState.state.phase, status: body.status ?? null }, 'session_state_change broadcast');
     }
 
     // 5. Append audit event (fire and forget)
@@ -261,7 +292,7 @@ dashboardRouter.patch(
         },
       })
       .then(({ error }) => {
-        if (error) console.error('[state] event log failed:', error.message);
+        if (error) logger.error({ sessionId, err: error.message }, 'state event log failed');
       });
 
     res.status(200).json({ updated: true, gameState });

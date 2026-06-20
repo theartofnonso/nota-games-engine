@@ -1,5 +1,6 @@
 import { supabase } from '../lib/supabase.js';
 import { getChannelName } from './channels.js';
+import logger from '../lib/logger.js';
 import { scoreBatch } from '../game/scoring.js';
 import {
   getOrCreateSession,
@@ -24,6 +25,7 @@ export function subscribeToSession(sessionId: string): void {
 
       if (!session.gameState) {
         // Game state not yet received; skip scoring but register player
+        logger.warn({ sessionId, playerId: batch.playerId }, 'motion batch received before game state — skipping score');
         registerPlayer(sessionId, batch.playerId, batch.playerName);
         return;
       }
@@ -39,6 +41,7 @@ export function subscribeToSession(sessionId: string): void {
       // Update in-memory engine
       session.engine.updatePlayer(batch.playerId, xpDelta);
       const totalXp = session.engine.getPlayerXp(batch.playerId);
+      logger.debug({ sessionId, playerId: batch.playerId, xpDelta, totalXp, phase: state.phase }, 'motion batch scored');
 
       // Persist to Postgres via upsert_score function
       const { error: dbError } = await supabase.schema('nota_games').rpc('upsert_score', {
@@ -52,7 +55,7 @@ export function subscribeToSession(sessionId: string): void {
       });
 
       if (dbError) {
-        console.error('[motion] upsert_score failed:', dbError.message);
+        logger.error({ sessionId, playerId: batch.playerId, err: dbError.message }, 'upsert_score failed');
         return;
       }
 
@@ -76,7 +79,7 @@ export function subscribeToSession(sessionId: string): void {
           },
         })
         .then(({ error }) => {
-          if (error) console.error('[motion] event log failed:', error.message);
+          if (error) logger.error({ sessionId, playerId: batch.playerId, err: error.message }, 'motion event log failed');
         });
 
       // Broadcast updated leaderboard to session:{id}:scores

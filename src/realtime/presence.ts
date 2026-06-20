@@ -1,5 +1,6 @@
 import { supabase } from '../lib/supabase.js';
 import { getChannelName } from './channels.js';
+import logger from '../lib/logger.js';
 import { getOrCreateSession, setChannel } from '../sessions/session-registry.js';
 import type { PlayerPresence, PresenceBroadcastPayload } from '../types/presence.js';
 
@@ -30,10 +31,10 @@ export function trackPlayerPresence(
         _broadcastPresence(sessionId, presenceChannel!);
       })
       .on('presence', { event: 'join' }, ({ newPresences }) => {
-        console.log('[presence] player joined:', newPresences);
+        logger.info({ sessionId, presences: newPresences }, 'player presence joined');
       })
       .on('presence', { event: 'leave' }, ({ leftPresences }) => {
-        console.log('[presence] player left:', leftPresences);
+        logger.info({ sessionId, presences: leftPresences }, 'player presence left');
       })
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
@@ -68,7 +69,7 @@ export async function untrackPlayerPresence(
   const session = getOrCreateSession(sessionId);
   if (!session.presenceChannel) return;
   await session.presenceChannel.untrack();
-  console.log('[presence] untracked player:', playerId, 'from session:', sessionId);
+  logger.info({ sessionId, playerId }, 'player presence untracked');
 }
 
 // Reads the current presence state and broadcasts the connected

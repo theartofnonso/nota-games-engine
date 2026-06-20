@@ -4,11 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start":     "node dist/index.js",
-    "dev":       "tsx watch src/index.ts",
-    "build":     "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
     "typecheck": "tsc -p tsconfig.check.json",
-    "test":         "echo \"Error: no test specified\" && exit 1",
+    "test": "echo \"Error: no test specified\" && exit 1",
     "test:session": "tsx scripts/test-session.ts"
   },
   "keywords": [],
@@ -20,12 +20,15 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.2",
+    "@types/pino-http": "^5.8.4",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }

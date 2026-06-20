@@ -1,102 +1,123 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { supabase, supabaseForUser } from '../../lib/supabase.js';
+import { z } from 'zod';
+import { supabase } from '../../lib/supabase.js';
 import { getChannelName } from '../../realtime/channels.js';
 import { subscribeToSession } from '../../realtime/motion-subscriber.js';
+import logger from '../../lib/logger.js';
 import { trackPlayerPresence, untrackPlayerPresence } from '../../realtime/presence.js';
 import {
   getOrCreateSession,
   registerPlayer,
 } from '../../sessions/session-registry.js';
 import { PlayerMotionBatchSchema } from '../../types/motion.js';
-import { requireAuth } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import type { PlayerMotionBatch } from '../../types/motion.js';
 
 export const sessionsRouter = Router();
 
-// All player-facing session routes require authentication
-sessionsRouter.use(requireAuth);
-
 // ─── POST /sessions/:id/join ──────────────────────────────────────────────────
 // Called once by the mobile app when a player enters a session.
-// Looks up their participant record (pre-assigned by instructor),
-// caches their team/duo context in the session registry,
-// and ensures the realtime subscription for this session is active.
+// No auth required — player identifies themselves by their pre-registered playerId.
 
-sessionsRouter.post('/:id/join', async (req: Request, res: Response): Promise<void> => {
-  const sessionId = req.params.id as string;
-  const user      = req.user;
-
-  // Confirm player is a registered participant in this session.
-  // Use the user-scoped client so RLS applies — players can only read
-  // participants in sessions they belong to (policy: "participants can
-  // read their session roster").
-  const { data: participant, error: participantError } = await supabaseForUser(req.jwt)
-    .schema('nota_games')
-    .from('session_participants')
-    .select('player_name, team_id, duo_id')
-    .eq('session_id', sessionId)
-    .eq('player_id', user.id)
-    .single();
-
-  if (participantError || !participant) {
-    res.status(403).json({ error: 'Not registered for this session' });
-    return;
-  }
-
-  // Cache player metadata in session registry —
-  // this is what resolves team_id and duo_id in motion-subscriber.ts
-  registerPlayer(
-    sessionId,
-    user.id,
-    participant.player_name,
-    participant.team_id ?? undefined,
-    participant.duo_id  ?? undefined,
-  );
-
-  // Ensure realtime subscription is active for this session.
-  // getOrCreateSession and subscribeToSession are both idempotent.
-  getOrCreateSession(sessionId);
-  subscribeToSession(sessionId);
-
-  // Track presence — dashboard sees connected players in real time
-  trackPlayerPresence(
-    sessionId,
-    user.id,
-    participant.player_name,
-    participant.team_id ?? null,
-    participant.duo_id  ?? null,
-  );
-
-  // Log player_joined event
-  await supabase
-    .schema('nota_games')
-    .from('game_events')
-    .insert({
-      session_id: sessionId,
-      player_id:  user.id,
-      event_type: 'player_joined',
-      payload: {
-        playerName: participant.player_name,
-        teamId:     participant.team_id,
-        duoId:      participant.duo_id,
-      },
-    });
-
-  res.status(200).json({
-    sessionId,
-    playerId:   user.id,
-    playerName: participant.player_name,
-    teamId:     participant.team_id  ?? null,
-    duoId:      participant.duo_id   ?? null,
-  });
+const JoinSessionSchema = z.object({
+  playerId: z.string().uuid(),
 });
+
+sessionsRouter.post(
+  '/:id/join',
+  validate(JoinSessionSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sessionId = req.params.id as string;
+    const { playerId } = req.body as z.infer<typeof JoinSessionSchema>;
+
+    // Confirm the session exists and is in a joinable state.
+    const { data: session, error: sessionError } = await supabase
+      .schema('nota_games')
+      .from('sessions')
+      .select('status')
+      .eq('id', sessionId)
+      .single();
+
+    if (sessionError || !session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    if (session.status === 'ended') {
+      res.status(403).json({ error: 'Session has already ended' });
+      return;
+    }
+
+    // Confirm player is pre-registered as a participant in this session.
+    const { data: participant, error: participantError } = await supabase
+      .schema('nota_games')
+      .from('session_participants')
+      .select('player_name, team_id, duo_id')
+      .eq('session_id', sessionId)
+      .eq('player_id', playerId)
+      .single();
+
+    if (participantError || !participant) {
+      res.status(403).json({ error: 'Not registered for this session' });
+      return;
+    }
+
+    // Cache player metadata in session registry
+    registerPlayer(
+      sessionId,
+      playerId,
+      participant.player_name,
+      participant.team_id ?? undefined,
+      participant.duo_id  ?? undefined,
+    );
+
+    // Ensure realtime subscription is active for this session (idempotent)
+    getOrCreateSession(sessionId);
+    subscribeToSession(sessionId);
+
+    // Track presence — dashboard sees connected players in real time
+    trackPlayerPresence(
+      sessionId,
+      playerId,
+      participant.player_name,
+      participant.team_id ?? null,
+      participant.duo_id  ?? null,
+    );
+
+    logger.info(
+      { sessionId, playerId, playerName: participant.player_name, teamId: participant.team_id ?? null, duoId: participant.duo_id ?? null },
+      'player joined session',
+    );
+
+    // Log player_joined event
+    await supabase
+      .schema('nota_games')
+      .from('game_events')
+      .insert({
+        session_id: sessionId,
+        player_id:  playerId,
+        event_type: 'player_joined',
+        payload: {
+          playerName: participant.player_name,
+          teamId:     participant.team_id,
+          duoId:      participant.duo_id,
+        },
+      });
+
+    res.status(200).json({
+      sessionId,
+      playerId,
+      playerName: participant.player_name,
+      teamId:     participant.team_id ?? null,
+      duoId:      participant.duo_id  ?? null,
+    });
+  },
+);
 
 // ─── POST /sessions/:id/motion ────────────────────────────────────────────────
 // Receives a PlayerMotionBatch from the mobile app and publishes it
 // to the session:motion realtime channel.
-// The Game Engine (motion-subscriber.ts) handles scoring from there.
 
 sessionsRouter.post(
   '/:id/motion',
@@ -104,19 +125,15 @@ sessionsRouter.post(
   async (req: Request, res: Response): Promise<void> => {
     const sessionId = req.params.id as string;
     const batch     = req.body as PlayerMotionBatch;
-    const user      = req.user;
 
     // Confirm player has joined this session
     const session = getOrCreateSession(sessionId);
-    if (!session.players.has(user.id)) {
+    if (!session.players.has(batch.playerId)) {
       res.status(403).json({ error: 'Not joined to this session. Call /join first.' });
       return;
     }
 
-    // Publish batch to the realtime motion channel.
-    // The Game Engine subscriber picks this up, scores it,
-    // persists to DB, and broadcasts the leaderboard update.
-    const channel = supabase.channel(getChannelName('motion', sessionId));
+    const channel  = supabase.channel(getChannelName('motion', sessionId));
     const sendError = await channel.send({
       type:    'broadcast',
       event:   'motion_batch',
@@ -124,33 +141,44 @@ sessionsRouter.post(
     });
 
     if (sendError !== 'ok') {
+      logger.error({ sessionId, playerId: batch.playerId, sendError }, 'failed to publish motion batch');
       res.status(502).json({ error: 'Failed to publish motion batch to realtime' });
       return;
     }
 
+    logger.debug({ sessionId, playerId: batch.playerId, sampleCount: batch.samples.length, batchStartedAt: batch.batchStartedAt }, 'motion batch published');
     res.status(202).json({ received: true, batchStartedAt: batch.batchStartedAt });
   },
 );
 
 // ─── DELETE /sessions/:id/leave ──────────────────────────────────────────────
 // Called when the player exits the session (app background, disconnect, etc.).
-// Removes their presence from the channel and logs the event.
 
-sessionsRouter.delete('/:id/leave', async (req: Request, res: Response): Promise<void> => {
-  const sessionId = req.params.id as string;
-  const user      = req.user;
-
-  await untrackPlayerPresence(sessionId, user.id);
-
-  await supabase
-    .schema('nota_games')
-    .from('game_events')
-    .insert({
-      session_id: sessionId,
-      player_id:  user.id,
-      event_type: 'player_left',
-      payload:    {},
-    });
-
-  res.status(200).json({ left: true });
+const LeaveSessionSchema = z.object({
+  playerId: z.string().uuid(),
 });
+
+sessionsRouter.delete(
+  '/:id/leave',
+  validate(LeaveSessionSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sessionId = req.params.id as string;
+    const { playerId } = req.body as z.infer<typeof LeaveSessionSchema>;
+
+    await untrackPlayerPresence(sessionId, playerId);
+
+    logger.info({ sessionId, playerId }, 'player left session');
+
+    await supabase
+      .schema('nota_games')
+      .from('game_events')
+      .insert({
+        session_id: sessionId,
+        player_id:  playerId,
+        event_type: 'player_left',
+        payload:    {},
+      });
+
+    res.status(200).json({ left: true });
+  },
+);
