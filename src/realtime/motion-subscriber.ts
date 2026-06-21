@@ -100,18 +100,14 @@ export function subscribeToSession(sessionId: string): void {
         leaderboard,
       };
 
-      // Use persistent scores channel — create once, reuse on every batch
+      // Use persistent scores channel — create once, reuse on every batch.
+      // httpSend posts via REST so no WebSocket subscription is needed.
       let scoresChannel = session.scoresChannel;
       if (!scoresChannel) {
         scoresChannel = supabase.channel(getChannelName('scores', sessionId));
-        scoresChannel.subscribe();
         setChannel(sessionId, 'scores', scoresChannel);
       }
-      await scoresChannel.send({
-        type: 'broadcast',
-        event: 'leaderboard_update',
-        payload: scoresPayload,
-      });
+      await scoresChannel.httpSend('leaderboard_update', scoresPayload);
     })
     .subscribe();
   setChannel(sessionId, 'motion', motionChannel);

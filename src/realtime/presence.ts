@@ -50,7 +50,6 @@ function _broadcastPresence(
   let scoresChannel = session.scoresChannel;
   if (!scoresChannel) {
     scoresChannel = supabase.channel(getChannelName('scores', sessionId));
-    scoresChannel.subscribe();
     setChannel(sessionId, 'scores', scoresChannel);
   }
 
@@ -60,9 +59,7 @@ function _broadcastPresence(
     updatedAt:        Date.now(),
   };
 
-  scoresChannel.send({
-    type:    'broadcast',
-    event:   'presence_update',
-    payload,
+  scoresChannel.httpSend('presence_update', payload).catch((err: unknown) => {
+    logger.error({ sessionId, err }, 'presence_update broadcast failed');
   });
 }
