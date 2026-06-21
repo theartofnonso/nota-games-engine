@@ -2,6 +2,7 @@ import { supabase } from '../lib/supabase.js';
 import { getChannelName } from './channels.js';
 import logger from '../lib/logger.js';
 import { scoreBatch } from '../game/scoring.js';
+import { subscribeToPresence } from './presence.js';
 import {
   getOrCreateSession,
   registerPlayer,
@@ -10,9 +11,11 @@ import {
 } from '../sessions/session-registry.js';
 import type { PlayerMotionBatch } from '../types/motion.js';
 import type { RuntimeGameState, ScoresBroadcastPayload } from '../types/session.js';
-import type { PresenceBroadcastPayload } from '../types/presence.js';
 
 export function subscribeToSession(sessionId: string): void {
+  const session = getOrCreateSession(sessionId);
+  if (session.motionChannel) return; // already subscribed — safe to call on every player join
+
   // ── Motion channel: receives PlayerMotionBatch from mobile devices ──
   const motionChannel = supabase.channel(getChannelName('motion', sessionId));
 
@@ -35,8 +38,8 @@ export function subscribeToSession(sessionId: string): void {
       // Register player metadata on first sight (idempotent)
       registerPlayer(sessionId, batch.playerId, batch.playerName);
 
-      // Score the batch — returns 0 during rest/passBreak/complete
-      const xpDelta = scoreBatch(batch, state.phase);
+      // Score the batch — returns 0 during rest/passBreak/complete or while paused
+      const xpDelta = state.isPaused ? 0 : scoreBatch(batch, state.phase);
 
       // Update in-memory engine
       session.engine.updatePlayer(batch.playerId, xpDelta);
@@ -126,4 +129,8 @@ export function subscribeToSession(sessionId: string): void {
     .subscribe();
 
   setChannel(sessionId, 'state', stateChannel);
+
+  // Presence listener — re-broadcasts to scores channel on every client
+  // join/leave so the controller sees connection changes in real time.
+  subscribeToPresence(sessionId);
 }

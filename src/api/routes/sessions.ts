@@ -6,16 +6,19 @@ import { supabase } from '../../lib/supabase.js';
 import { getChannelName } from '../../realtime/channels.js';
 import { subscribeToSession } from '../../realtime/motion-subscriber.js';
 import logger from '../../lib/logger.js';
-import { trackPlayerPresence, untrackPlayerPresence } from '../../realtime/presence.js';
 import {
   getOrCreateSession,
   registerPlayer,
+  removePlayer,
 } from '../../sessions/session-registry.js';
 import { PlayerMotionBatchSchema } from '../../types/motion.js';
-import { validate } from '../middleware/validate.js';
+import { validate, validateUUIDParam } from '../middleware/validate.js';
 import type { PlayerMotionBatch } from '../../types/motion.js';
 
 export const sessionsRouter = Router();
+
+// Reject non-UUID session IDs at the router boundary before any handler runs
+sessionsRouter.param('id', validateUUIDParam);
 
 // ─── POST /sessions/:id/join ──────────────────────────────────────────────────
 // Self-registration + join in one step. No auth required.
@@ -110,17 +113,8 @@ sessionsRouter.post(
     );
 
     // Ensure realtime subscription is active for this session (idempotent)
-    getOrCreateSession(sessionId);
+    const sessionRecord = getOrCreateSession(sessionId);
     subscribeToSession(sessionId);
-
-    // Track presence
-    trackPlayerPresence(
-      sessionId,
-      playerId,
-      participant.player_name,
-      participant.team_id ?? null,
-      participant.duo_id  ?? null,
-    );
 
     logger.info(
       { sessionId, playerId, playerName: participant.player_name, isRejoin },
@@ -146,6 +140,10 @@ sessionsRouter.post(
       teamId:     participant.team_id ?? null,
       duoId:      participant.duo_id  ?? null,
       isRejoin,
+      // Current game state — non-null only when the session is already running.
+      // Late joiners and re-joiners should check this and start motion immediately
+      // if isRunning is true, rather than waiting for the next state broadcast.
+      gameState: sessionRecord.gameState ?? null,
     });
   },
 );
@@ -168,8 +166,10 @@ sessionsRouter.post(
       return;
     }
 
-    const channel  = supabase.channel(getChannelName('motion', sessionId));
-    const sendError = await channel.send({
+    // Reuse the channel already held in the registry — avoids creating and
+    // abandoning a new Supabase channel object on every motion batch request.
+    const motionChannel = session.motionChannel ?? supabase.channel(getChannelName('motion', sessionId));
+    const sendError = await motionChannel.send({
       type:    'broadcast',
       event:   'motion_batch',
       payload: batch,
@@ -200,8 +200,7 @@ sessionsRouter.delete(
     const sessionId = req.params.id as string;
     const { playerId } = req.body as z.infer<typeof LeaveSessionSchema>;
 
-    await untrackPlayerPresence(sessionId, playerId);
-
+    removePlayer(sessionId, playerId);
     logger.info({ sessionId, playerId }, 'player left session');
 
     await supabase

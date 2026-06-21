@@ -4,76 +4,41 @@ import logger from '../lib/logger.js';
 import { getOrCreateSession, setChannel } from '../sessions/session-registry.js';
 import type { PlayerPresence, PresenceBroadcastPayload } from '../types/presence.js';
 
-export function trackPlayerPresence(
-  sessionId:  string,
-  playerId:   string,
-  playerName: string,
-  teamId:     string | null,
-  duoId:      string | null,
-): void {
+// Subscribes the server to the session's presence channel as a passive listener.
+//
+// Mobile clients call channel.track() from their own Supabase connection.
+// When a client connects, Supabase fires 'join'. When their WebSocket drops
+// (app close, network loss, explicit untrack), Supabase fires 'leave'.
+//
+// The server listens for all three events ('sync', 'join', 'leave') and
+// re-broadcasts the full connected player list to session:{id}:scores so the
+// controller stays in sync in real time without polling.
+export function subscribeToPresence(sessionId: string): void {
   const session = getOrCreateSession(sessionId);
+  if (session.presenceChannel) return; // already set up for this session
 
-  // Reuse existing presence channel if already created for this session
-  let presenceChannel = session.presenceChannel;
+  const presenceChannel = supabase.channel(getChannelName('presence', sessionId));
 
-  if (!presenceChannel) {
-    // Use a dedicated presence channel, not the motion channel.
-    // supabase.channel() returns the same object for the same name — if we
-    // reused 'motion' here, we'd try to add presence callbacks to an already-
-    // subscribed channel, which Realtime forbids (error 42P17 equivalent).
-    presenceChannel = supabase.channel(getChannelName('presence', sessionId), {
-      config: { presence: { key: sessionId } },
-    });
+  presenceChannel
+    .on('presence', { event: 'sync' }, () => {
+      logger.info({ sessionId }, 'presence sync');
+      _broadcastPresence(sessionId, presenceChannel);
+    })
+    .on('presence', { event: 'join' }, ({ newPresences }) => {
+      logger.info({ sessionId, presences: newPresences }, 'player presence joined');
+      _broadcastPresence(sessionId, presenceChannel);
+    })
+    .on('presence', { event: 'leave' }, ({ leftPresences }) => {
+      logger.info({ sessionId, presences: leftPresences }, 'player presence left');
+      _broadcastPresence(sessionId, presenceChannel);
+    })
+    .subscribe();
 
-    presenceChannel
-      .on('presence', { event: 'sync' }, () => {
-        // Full presence state re-synced — broadcast updated player list
-        _broadcastPresence(sessionId, presenceChannel!);
-      })
-      .on('presence', { event: 'join' }, ({ newPresences }) => {
-        logger.info({ sessionId, presences: newPresences }, 'player presence joined');
-      })
-      .on('presence', { event: 'leave' }, ({ leftPresences }) => {
-        logger.info({ sessionId, presences: leftPresences }, 'player presence left');
-      })
-      .subscribe(async (status) => {
-        if (status === 'SUBSCRIBED') {
-          // Track this player's presence once the channel is ready
-          await presenceChannel!.track({
-            playerId,
-            playerName,
-            teamId,
-            duoId,
-            joinedAt: Date.now(),
-          } satisfies PlayerPresence);
-        }
-      });
-
-    setChannel(sessionId, 'presence', presenceChannel);
-  } else {
-    // Channel already exists — just track the new player
-    presenceChannel.track({
-      playerId,
-      playerName,
-      teamId,
-      duoId,
-      joinedAt: Date.now(),
-    } satisfies PlayerPresence);
-  }
+  setChannel(sessionId, 'presence', presenceChannel);
 }
 
-export async function untrackPlayerPresence(
-  sessionId: string,
-  playerId:  string,
-): Promise<void> {
-  const session = getOrCreateSession(sessionId);
-  if (!session.presenceChannel) return;
-  await session.presenceChannel.untrack();
-  logger.info({ sessionId, playerId }, 'player presence untracked');
-}
-
-// Reads the current presence state and broadcasts the connected
-// player list to the scores channel so the dashboard stays in sync.
+// Reads the current presence state and broadcasts the full connected-player
+// list to session:{id}:scores so the controller and scoreboard stay in sync.
 function _broadcastPresence(
   sessionId:       string,
   presenceChannel: ReturnType<typeof supabase.channel>,

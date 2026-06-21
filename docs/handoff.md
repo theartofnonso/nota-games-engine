@@ -68,11 +68,12 @@ Errors:
 App open
 └── Join session with name (one tap)
     └── Persist returned playerId to local storage
+    └── If gameState.state.sensorActive = true → start sending motion batches immediately
 └── [background] subscribe to session:state and session:scores channels
 └── On session_state_change:
-    ├── state.isRunning = true  → start sending motion batches every 5s
-    ├── state.isPaused  = true  → pause sending
-    ├── state.phase = 'complete' → stop sending → call /leave → show results
+    ├── state.sensorActive = true  → start (or continue) sending motion batches every 5s
+    ├── state.sensorActive = false → stop sending
+    └── state.sessionEnded = true  → stop sending → call /leave → show results
 ```
 
 **Important:** The `playerId` returned by `/join` must be stored persistently on the device (local storage / keychain). It is required for all subsequent calls (`/motion`, `/leave`) and enables re-joining the same session after a disconnect without losing score history.
@@ -101,7 +102,8 @@ Response 200:
   "playerName": "string",
   "teamId":     "uuid | null",
   "duoId":      "uuid | null",
-  "isRejoin":   false
+  "isRejoin":   false,
+  "gameState":  null
 }
 ```
 
@@ -109,6 +111,7 @@ Field notes:
 - `playerId` — persist this immediately. Send it in all subsequent requests.
 - `isRejoin` — true if the player was already registered (reconnect scenario). No duplicate event is logged.
 - `teamId` / `duoId` — null until the instructor runs team assignment from the controller.
+- `gameState` — the current `SessionStateChange` payload if the session is already running, or `null` if it hasn't started yet. **Check this immediately after joining.** If `gameState.state.sensorActive` is true, start sending motion batches right away — do not wait for the first `session_state_change` broadcast.
 
 Errors:
 - 400 — missing or invalid `playerName`
@@ -119,7 +122,7 @@ Errors:
 
 #### POST /sessions/:id/motion
 
-Send a batch of raw accelerometer samples every 5 seconds while `state.isRunning` is true. Pause when `state.isPaused` is true or `state.phase` is not `'work'`.
+Send a batch of raw accelerometer samples every 5 seconds while `state.sensorActive` is true. Stop when `state.sensorActive` becomes false.
 
 No authentication required.
 
@@ -156,7 +159,7 @@ Errors:
 
 #### DELETE /sessions/:id/leave
 
-Call when the session ends or the player exits the app. Untracks presence and logs a `player_left` event.
+Call when the session ends or the player exits the app. Logs a `player_left` event and removes the player from the server's in-memory session. Call `presenceChannel.untrack()` client-side before this endpoint so the presence channel is cleaned up first.
 
 No authentication required.
 
@@ -190,13 +193,26 @@ const scoresChannel = supabase
 const stateChannel = supabase
   .channel(`session:${sessionId}:state`)
   .on('broadcast', { event: 'session_state_change' }, ({ payload }) => {
-    if (payload.state.isRunning)              startSendingMotion();
-    if (payload.state.isPaused)               pauseSendingMotion();
-    if (payload.state.phase === 'complete')   stopAndLeave();
+    if (payload.state.sensorActive) startSendingMotion();
+    else                            stopSendingMotion();
+    if (payload.state.sessionEnded) stopAndLeave();
   })
   .subscribe();
 
-// On leave:
+// Presence — track yourself after /join so the controller sees you as connected.
+// Supabase automatically removes your entry when your WebSocket drops, which
+// triggers an immediate presence_update broadcast to the controller.
+const presenceChannel = supabase
+  .channel(`session:${sessionId}:presence`)
+  .subscribe(async (status) => {
+    if (status === 'SUBSCRIBED') {
+      await presenceChannel.track({ playerId, playerName, teamId, duoId, joinedAt: Date.now() });
+    }
+  });
+
+// On leave (call before /leave endpoint):
+await presenceChannel.untrack();
+await supabase.removeChannel(presenceChannel);
 await supabase.removeChannel(scoresChannel);
 await supabase.removeChannel(stateChannel);
 ```
@@ -233,6 +249,11 @@ interface PresenceUpdate {
 interface SessionStateChange {
   timestamp: number;
   state: {
+    // Binary sensor signals — sensor client only needs these two fields
+    sensorActive: boolean; // true = send motion batches; false = stop
+    sessionEnded: boolean; // true = call /leave and show results
+
+    // Full game state — used by controller UI and scoreboard
     phase:              'work' | 'rest' | 'passBreak' | 'complete';
     currentStation:     number;
     currentRound:       number;
@@ -389,7 +410,7 @@ Response 200:
 
 Errors:
 - 400 — any entry has `duoId` without `teamId`, or `assignments` is empty
-- 500 — DB update failed (operation is all-or-nothing)
+- 500 — DB update failed; assignments in earlier groups may have already been applied
 
 ---
 
@@ -449,6 +470,8 @@ Transition reference:
 - Resume after pause:      `{ "status": "active", "phase": "work", "isRunning": true, ... }`
 - End session:             `{ "status": "ended" }`
 
+> **On end:** The server automatically broadcasts `session_state_change` with `phase: "complete"` and `isRunning: false` to all connected clients, even if `phase` is omitted from the request. Clients always receive a disconnect signal. After the broadcast, the server tears down all Realtime channels for the session and clears the in-memory registry — subsequent motion batches from any player are rejected with 403.
+
 Response 200:
 ```json
 {
@@ -457,7 +480,7 @@ Response 200:
 }
 ```
 
-`gameState` is `null` when no `phase` was included in the request.
+`gameState` is `null` only for non-end status-only transitions (e.g. `{ "status": "active" }` at session start). When `status: "ended"` is sent without a `phase`, the server synthesises `phase: "complete"` — `gameState` will be non-null with `sessionEnded: true`.
 
 ---
 
@@ -496,6 +519,12 @@ Response 200:
 const stateChannel = supabase
   .channel(`session:${sessionId}:state`)
   .on('broadcast', { event: 'session_state_change' }, ({ payload }) => {
+    // Sensor client — only these two fields needed
+    if (payload.state.sensorActive) startSendingMotion();
+    else                            stopSendingMotion();
+    if (payload.state.sessionEnded) leaveSession();
+
+    // Controller / scoreboard UI — full state available
     updateControllerUI(payload.state);
   })
   .subscribe();
@@ -542,12 +571,13 @@ The leaderboard updates automatically after every motion batch (~5 seconds per a
 | `session:{id}:motion` | Mobile app | Game Engine | `motion_batch` |
 | `session:{id}:scores` | Game Engine | Mobile + Scoreboard + Controller | `leaderboard_update`, `presence_update` |
 | `session:{id}:state` | Game controller | Mobile + Scoreboard + Game Engine | `session_state_change` |
-| `session:{id}:presence` | Game Engine (internal) | Game Engine only | Supabase Presence sync |
+| `session:{id}:presence` | Mobile app (each device tracks itself) | Game Engine (listener) | Supabase Presence sync/join/leave |
 
-> **Note:** Clients do not subscribe to `session:{id}:presence` directly.
-> The server uses it internally to track connected players via Supabase Presence.
-> Presence state is forwarded to `session:{id}:scores` as `presence_update` events,
-> which is the only channel clients need to subscribe to for both scores and presence.
+> **Note:** Each mobile client tracks its own presence on `session:{id}:presence`.
+> The server listens to that channel and re-broadcasts the full connected-player list
+> to `session:{id}:scores` as `presence_update` events on every join or leave —
+> including automatic disconnects detected when a device's WebSocket drops.
+> The controller subscribes only to `session:{id}:scores` for both scores and presence.
 
 ---
 

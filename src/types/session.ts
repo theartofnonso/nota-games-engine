@@ -22,6 +22,9 @@ export interface RuntimeGameState {
     totalIntervals: number;
     startedAtMs?: number;
     endedAtMs?: number;
+    // Derived signals for the sensor client — no game-state interpretation needed
+    sensorActive: boolean; // true = send motion batches; false = stop
+    sessionEnded: boolean; // true = call /leave and show results
   };
 }
 
