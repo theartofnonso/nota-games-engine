@@ -5,19 +5,23 @@ import { supabase, supabaseForUser } from '../../lib/supabase.js';
 import { getChannelName } from '../../realtime/channels.js';
 import logger from '../../lib/logger.js';
 import {
+  cleanupSession,
   getOrCreateSession,
   setChannel,
   updateGameState,
   updatePlayerTeam,
 } from '../../sessions/session-registry.js';
 import { requireAuth } from '../middleware/auth.js';
-import { validate } from '../middleware/validate.js';
+import { validate, validateUUIDParam } from '../middleware/validate.js';
 import type { RuntimeGameState } from '../../types/session.js';
 
 export const dashboardRouter = Router();
 
 // All dashboard routes require authentication
 dashboardRouter.use(requireAuth);
+
+// Reject non-UUID session IDs at the router boundary before any handler runs
+dashboardRouter.param('id', validateUUIDParam);
 
 // ── POST /sessions ─────────────────────────────────────────────────────────
 // Creates a new session row.  Called by the instructor dashboard before
@@ -519,24 +523,33 @@ dashboardRouter.patch(
       }
     }
 
-    // 2. Build and broadcast RuntimeGameState — only when 'phase' is provided.
-    //    Simple status-only transitions (start/end) skip the broadcast; the
-    //    instructor sends a full state update separately once the timer begins.
+    // 2. Build and broadcast RuntimeGameState.
+    //    When 'phase' is explicitly provided, use it as-is.
+    //    When status === 'ended' and no phase was given, synthesise 'complete'
+    //    so devices always receive a disconnect signal — never silently stranded.
+    //    Simple non-end status-only transitions (e.g. 'active' alone at start)
+    //    skip the broadcast; the controller sends a full state separately.
+    const effectivePhase = body.phase ?? (body.status === 'ended' ? 'complete' : undefined);
     let gameState: RuntimeGameState | null = null;
 
-    if (body.phase !== undefined) {
+    if (effectivePhase !== undefined) {
+      const resolvedIsPaused = body.isPaused ?? (body.status === 'paused');
+
       gameState = {
         timestamp: Date.now(),
         state: {
-          phase:              body.phase,
+          phase:              effectivePhase,
           currentStation:     body.currentStation  ?? 1,
           currentRound:       body.currentRound    ?? 1,
           currentPass:        body.currentPass     ?? 1,
           timeRemaining:      body.timeRemaining   ?? 0,
           isRunning:          body.isRunning       ?? (body.status === 'active'),
-          isPaused:           body.isPaused        ?? (body.status === 'paused'),
+          isPaused:           resolvedIsPaused,
           completedIntervals: body.completedIntervals ?? 0,
           totalIntervals:     body.totalIntervals     ?? 0,
+          // Binary signals so the sensor client needs no game-state knowledge
+          sensorActive: effectivePhase === 'work' && !resolvedIsPaused,
+          sessionEnded: effectivePhase === 'complete',
         },
       };
 
@@ -564,14 +577,22 @@ dashboardRouter.patch(
       logger.info({ sessionId, phase: gameState.state.phase, status: body.status ?? null }, 'session_state_change broadcast');
     }
 
+    // 3b. Tear down Realtime channels and remove from registry after the
+    //     broadcast resolves. Subsequent /motion calls will find no players
+    //     in the new empty record and return 403.
+    if (body.status === 'ended') {
+      await cleanupSession(sessionId);
+      logger.info({ sessionId }, 'session cleaned up');
+    }
+
     // 5. Append audit event (fire and forget)
     const eventType =
-      body.status === 'active'  ? 'session_started'  :
-      body.status === 'paused'  ? 'session_paused'   :
-      body.status === 'ended'   ? 'session_ended'    :
-      body.phase  === 'work'    ? 'pass_started'     :
-      body.phase  === 'rest'    ? 'pass_ended'       :
-                                  'session_resumed';
+      body.status === 'active'       ? 'session_started'  :
+      body.status === 'paused'       ? 'session_paused'   :
+      body.status === 'ended'        ? 'session_ended'    :
+      effectivePhase === 'work'      ? 'pass_started'     :
+      effectivePhase === 'rest'      ? 'pass_ended'       :
+                                       'session_resumed';
 
     supabase
       .schema('nota_games')
@@ -580,7 +601,7 @@ dashboardRouter.patch(
         session_id:   sessionId,
         player_id:    req.user.id,
         event_type:   eventType,
-        phase:        body.phase        ?? null,
+        phase:        effectivePhase      ?? null,
         current_pass: body.currentPass  ?? null,
         payload: {
           status:    body.status    ?? null,

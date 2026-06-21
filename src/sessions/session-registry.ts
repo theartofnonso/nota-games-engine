@@ -53,6 +53,10 @@ export function registerPlayer(
   session.players.set(playerId, { playerName, teamId, duoId });
 }
 
+export function removePlayer(sessionId: string, playerId: string): void {
+  sessions.get(sessionId)?.players.delete(playerId);
+}
+
 export function updatePlayerTeam(
   sessionId: string,
   playerId:  string,
@@ -67,6 +71,24 @@ export function updatePlayerTeam(
 }
 
 export function removeSession(sessionId: string): void {
+  sessions.delete(sessionId);
+}
+
+// Unsubscribes all Realtime channels for a session and removes it from the
+// registry. Call this after the final session_state_change broadcast so that
+// subsequent motion batches are rejected (no players in the new empty record).
+export async function cleanupSession(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+
+  const channels = [
+    session.motionChannel,
+    session.scoresChannel,
+    session.stateChannel,
+    session.presenceChannel,
+  ].filter((ch): ch is ReturnType<typeof supabase.channel> => ch !== null);
+
+  await Promise.all(channels.map((ch) => supabase.removeChannel(ch)));
   sessions.delete(sessionId);
 }
 
