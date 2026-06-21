@@ -8,6 +8,7 @@ import {
   getOrCreateSession,
   setChannel,
   updateGameState,
+  updatePlayerTeam,
 } from '../../sessions/session-registry.js';
 import { requireAuth } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
@@ -151,19 +152,315 @@ dashboardRouter.get(
   async (req: Request, res: Response): Promise<void> => {
     const sessionId = req.params.id as string;
 
-    const { data, error } = await supabase
+    // Fetch participants first, then resolve team/duo names in a second query.
+    // Embedding teams(name) directly in a custom schema select causes PostgREST
+    // to silently return empty results when FK relationships can't be resolved.
+    const { data: participants, error } = await supabase
       .schema('nota_games')
       .from('session_participants')
-      .select('*, teams(name, color), duos(name)')
+      .select('*')
       .eq('session_id', sessionId)
       .order('joined_at', { ascending: true });
 
     if (error) {
+      logger.error({ sessionId, err: error.message }, 'failed to fetch participants');
       res.status(500).json({ error: 'Failed to fetch participants', detail: error.message });
       return;
     }
 
-    res.status(200).json({ sessionId, participants: data ?? [] });
+    logger.debug({ sessionId, count: participants?.length ?? 0 }, 'participants fetched');
+
+    if (!participants || participants.length === 0) {
+      res.status(200).json({ sessionId, participants: [] });
+      return;
+    }
+
+    // Resolve team and duo names for participants that have assignments
+    const teamIds = [...new Set(participants.map((p) => p.team_id).filter(Boolean))];
+    const duoIds  = [...new Set(participants.map((p) => p.duo_id).filter(Boolean))];
+
+    const [teamsResult, duosResult] = await Promise.all([
+      teamIds.length > 0
+        ? supabase.schema('nota_games').from('teams').select('id, name').in('id', teamIds)
+        : Promise.resolve({ data: [] }),
+      duoIds.length > 0
+        ? supabase.schema('nota_games').from('duos').select('id, name').in('id', duoIds)
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    const teamMap = new Map((teamsResult.data ?? []).map((t: { id: string; name: string }) => [t.id, t.name]));
+    const duoMap  = new Map((duosResult.data  ?? []).map((d: { id: string; name: string }) => [d.id, d.name]));
+
+    const enriched = participants.map((p) => ({
+      ...p,
+      teams: p.team_id ? { name: teamMap.get(p.team_id) ?? null } : null,
+      duos:  p.duo_id  ? { name: duoMap.get(p.duo_id)   ?? null } : null,
+    }));
+
+    res.status(200).json({ sessionId, participants: enriched });
+  },
+);
+
+// ── POST /sessions/:id/participants/assign ────────────────────────────────
+// Auto-assigns all unassigned participants to the session's teams using
+// round-robin distribution (smallest team first).
+// Requires at least one team to exist for the session.
+// Updates the in-memory registry for any players already in the session.
+
+dashboardRouter.post(
+  '/:id/participants/assign',
+  async (req: Request, res: Response): Promise<void> => {
+    const sessionId = req.params.id as string;
+
+    // Fetch teams with their current participant counts
+    const { data: teams, error: teamsError } = await supabase
+      .schema('nota_games')
+      .from('teams')
+      .select('id, name, session_participants(count)')
+      .eq('session_id', sessionId);
+
+    if (teamsError) {
+      res.status(500).json({ error: 'Failed to fetch teams', detail: teamsError.message });
+      return;
+    }
+
+    if (!teams || teams.length === 0) {
+      res.status(409).json({ error: 'No teams exist for this session. Create teams before assigning.' });
+      return;
+    }
+
+    // Fetch unassigned participants
+    const { data: unassigned, error: participantsError } = await supabase
+      .schema('nota_games')
+      .from('session_participants')
+      .select('id, player_id')
+      .eq('session_id', sessionId)
+      .is('team_id', null);
+
+    if (participantsError) {
+      res.status(500).json({ error: 'Failed to fetch participants', detail: participantsError.message });
+      return;
+    }
+
+    if (!unassigned || unassigned.length === 0) {
+      res.status(200).json({ assigned: 0, message: 'All participants already have a team' });
+      return;
+    }
+
+    // Sort teams by current size ascending so we fill the smallest teams first
+    const teamCounts = teams.map((t) => ({
+      id:    t.id as string,
+      name:  t.name as string,
+      count: (t.session_participants as { count: number }[])[0]?.count ?? 0,
+    }));
+    teamCounts.sort((a, b) => a.count - b.count);
+
+    // Round-robin assign
+    const assignments: { participantId: string; playerId: string; teamId: string }[] = [];
+    unassigned.forEach((participant, i) => {
+      const team = teamCounts[i % teamCounts.length]!;
+      assignments.push({ participantId: participant.id as string, playerId: participant.player_id as string, teamId: team.id });
+      team.count++;
+    });
+
+    // Bulk update — one update per unique team to minimise round-trips
+    const updatesByTeam = new Map<string, string[]>();
+    for (const a of assignments) {
+      const ids = updatesByTeam.get(a.teamId) ?? [];
+      ids.push(a.participantId);
+      updatesByTeam.set(a.teamId, ids);
+    }
+
+    for (const [teamId, ids] of updatesByTeam) {
+      const { error: updateError } = await supabase
+        .schema('nota_games')
+        .from('session_participants')
+        .update({ team_id: teamId, assigned_by: 'auto' })
+        .in('id', ids);
+
+      if (updateError) {
+        logger.error({ sessionId, teamId, err: updateError.message }, 'auto-assign update failed');
+        res.status(500).json({ error: 'Failed to assign teams', detail: updateError.message });
+        return;
+      }
+    }
+
+    // Propagate to in-memory registry for any players already in the session
+    for (const a of assignments) {
+      updatePlayerTeam(sessionId, a.playerId, a.teamId, undefined);
+    }
+
+    logger.info({ sessionId, assigned: assignments.length }, 'auto team assignment complete');
+    res.status(200).json({ assigned: assignments.length });
+  },
+);
+
+// ── PATCH /sessions/:id/participants ─────────────────────────────────────
+// Bulk manual assignment — assign multiple participants to teams in one call.
+// Each entry in the assignments array is applied independently; a single DB
+// error aborts the whole operation and returns a 500 with the failing entry.
+// Updates the in-memory registry and session_results for all affected players.
+
+const BulkAssignItemSchema = z.object({
+  participantId: z.string().uuid(),
+  teamId:        z.string().uuid().nullable(),
+  duoId:         z.string().uuid().nullable().optional(),
+}).refine(
+  (d) => !(d.duoId && !d.teamId),
+  { message: 'duoId requires a teamId' },
+);
+
+const BulkAssignSchema = z.object({
+  assignments: z.array(BulkAssignItemSchema).min(1),
+});
+
+dashboardRouter.patch(
+  '/:id/participants',
+  validate(BulkAssignSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sessionId  = req.params.id as string;
+    const { assignments } = req.body as z.infer<typeof BulkAssignSchema>;
+
+    // Group by (teamId, duoId) so participants sharing the same assignment
+    // get a single UPDATE instead of one per participant.
+    type GroupKey = string; // `${teamId}:${duoId}`
+    const groups = new Map<GroupKey, { teamId: string | null; duoId: string | null; ids: string[] }>();
+
+    for (const a of assignments) {
+      const teamId = a.teamId ?? null;
+      const duoId  = teamId ? (a.duoId ?? null) : null; // clear duo if team cleared
+      const key: GroupKey = `${teamId}:${duoId}`;
+      const group = groups.get(key) ?? { teamId, duoId, ids: [] };
+      group.ids.push(a.participantId);
+      groups.set(key, group);
+    }
+
+    // Apply each group as a single UPDATE
+    for (const { teamId, duoId, ids } of groups.values()) {
+      const { error: updateError } = await supabase
+        .schema('nota_games')
+        .from('session_participants')
+        .update({ team_id: teamId, duo_id: duoId, assigned_by: 'manual' })
+        .in('id', ids)
+        .eq('session_id', sessionId);
+
+      if (updateError) {
+        logger.error({ sessionId, teamId, duoId, ids, err: updateError.message }, 'bulk assign update failed');
+        res.status(500).json({ error: 'Bulk assignment failed', detail: updateError.message });
+        return;
+      }
+    }
+
+    // Fetch the updated rows to return accurate state and propagate to registry
+    const { data: updated, error: fetchError } = await supabase
+      .schema('nota_games')
+      .from('session_participants')
+      .select('id, player_id, player_name, team_id, duo_id')
+      .in('id', assignments.map((a) => a.participantId))
+      .eq('session_id', sessionId);
+
+    if (fetchError || !updated) {
+      res.status(500).json({ error: 'Assignment applied but failed to fetch results', detail: fetchError?.message });
+      return;
+    }
+
+    // Propagate to in-memory registry and session_results
+    for (const p of updated) {
+      updatePlayerTeam(sessionId, p.player_id as string, p.team_id ?? undefined, p.duo_id ?? undefined);
+
+      await supabase
+        .schema('nota_games')
+        .from('session_results')
+        .update({ team_id: p.team_id, duo_id: p.duo_id })
+        .eq('session_id', sessionId)
+        .eq('player_id', p.player_id);
+    }
+
+    logger.info({ sessionId, count: updated.length }, 'bulk manual team assignment complete');
+
+    res.status(200).json({
+      assigned: updated.length,
+      participants: updated.map((p) => ({
+        id:         p.id,
+        playerId:   p.player_id,
+        playerName: p.player_name,
+        teamId:     p.team_id  ?? null,
+        duoId:      p.duo_id   ?? null,
+      })),
+    });
+  },
+);
+
+// ── PATCH /sessions/:id/participants/:participantId ───────────────────────
+// Manually assigns a single participant to a team (and optionally a duo).
+// Clears duo assignment if teamId is set to null.
+// Updates the in-memory registry if the player is currently in the session.
+
+const ManualAssignSchema = z.object({
+  teamId: z.string().uuid().nullable(),
+  duoId:  z.string().uuid().nullable().optional(),
+}).refine(
+  (d) => !(d.duoId && !d.teamId),
+  { message: 'duoId requires a teamId' },
+);
+
+dashboardRouter.patch(
+  '/:id/participants/:participantId',
+  validate(ManualAssignSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sessionId     = req.params.id as string;
+    const participantId = req.params.participantId as string;
+    const body          = req.body as z.infer<typeof ManualAssignSchema>;
+
+    const teamId = body.teamId;
+    const duoId  = body.teamId ? (body.duoId ?? null) : null; // clear duo if team cleared
+
+    const { data: participant, error } = await supabase
+      .schema('nota_games')
+      .from('session_participants')
+      .update({
+        team_id:     teamId,
+        duo_id:      duoId,
+        assigned_by: 'manual',
+      })
+      .eq('id', participantId)
+      .eq('session_id', sessionId)
+      .select('player_id, player_name, team_id, duo_id')
+      .single();
+
+    if (error || !participant) {
+      res.status(error ? 500 : 404).json({ error: 'Failed to update participant', detail: error?.message });
+      return;
+    }
+
+    // Propagate to in-memory registry if player is currently in the session
+    updatePlayerTeam(
+      sessionId,
+      participant.player_id as string,
+      participant.team_id   ?? undefined,
+      participant.duo_id    ?? undefined,
+    );
+
+    // Keep session_results in sync if a score row already exists
+    await supabase
+      .schema('nota_games')
+      .from('session_results')
+      .update({ team_id: teamId, duo_id: duoId })
+      .eq('session_id', sessionId)
+      .eq('player_id', participant.player_id);
+
+    logger.info(
+      { sessionId, participantId, playerId: participant.player_id, teamId, duoId },
+      'manual team assignment',
+    );
+
+    res.status(200).json({
+      id:         participantId,
+      playerId:   participant.player_id,
+      playerName: participant.player_name,
+      teamId:     participant.team_id  ?? null,
+      duoId:      participant.duo_id   ?? null,
+    });
   },
 );
 

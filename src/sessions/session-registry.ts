@@ -53,6 +53,19 @@ export function registerPlayer(
   session.players.set(playerId, { playerName, teamId, duoId });
 }
 
+export function updatePlayerTeam(
+  sessionId: string,
+  playerId:  string,
+  teamId:    string | undefined,
+  duoId:     string | undefined,
+): void {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  const player = session.players.get(playerId);
+  if (!player) return;
+  session.players.set(playerId, { ...player, teamId, duoId });
+}
+
 export function removeSession(sessionId: string): void {
   sessions.delete(sessionId);
 }

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
+import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { supabase } from '../../lib/supabase.js';
 import { getChannelName } from '../../realtime/channels.js';
@@ -17,21 +18,33 @@ import type { PlayerMotionBatch } from '../../types/motion.js';
 export const sessionsRouter = Router();
 
 // ─── POST /sessions/:id/join ──────────────────────────────────────────────────
-// Called once by the mobile app when a player enters a session.
-// No auth required — player identifies themselves by their pre-registered playerId.
+// Self-registration + join in one step. No auth required.
+//
+// First-time join: player sends { playerName } and optionally a client-generated
+// { playerId } UUID. Server registers them as a participant and returns the
+// playerId. The mobile app should persist this UUID and send it on every
+// subsequent call (motion batches, re-joins, leave).
+//
+// Re-join (disconnect/reconnect): player sends the same { playerId } they
+// received on first join. Server finds the existing participant record and
+// re-activates the session subscription and presence tracking.
+//
+// Team assignment is NOT done here — the instructor triggers it separately
+// from the dashboard after all players have joined.
 
 const JoinSessionSchema = z.object({
-  playerId: z.string().uuid(),
+  playerName: z.string().min(1),
+  playerId:   z.string().uuid().optional(),
 });
 
 sessionsRouter.post(
   '/:id/join',
   validate(JoinSessionSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const sessionId = req.params.id as string;
-    const { playerId } = req.body as z.infer<typeof JoinSessionSchema>;
+    const sessionId  = req.params.id as string;
+    const { playerName, playerId: clientPlayerId } = req.body as z.infer<typeof JoinSessionSchema>;
 
-    // Confirm the session exists and is in a joinable state.
+    // Confirm the session exists and is joinable
     const { data: session, error: sessionError } = await supabase
       .schema('nota_games')
       .from('sessions')
@@ -49,8 +62,10 @@ sessionsRouter.post(
       return;
     }
 
-    // Confirm player is pre-registered as a participant in this session.
-    const { data: participant, error: participantError } = await supabase
+    const playerId = clientPlayerId ?? randomUUID();
+
+    // Check for an existing participant record — handles re-joins
+    const { data: existing } = await supabase
       .schema('nota_games')
       .from('session_participants')
       .select('player_name, team_id, duo_id')
@@ -58,12 +73,34 @@ sessionsRouter.post(
       .eq('player_id', playerId)
       .single();
 
-    if (participantError || !participant) {
-      res.status(403).json({ error: 'Not registered for this session' });
-      return;
+    let participant = existing;
+    let isRejoin    = !!existing;
+
+    if (!participant) {
+      // First-time join — self-register
+      const { data: inserted, error: insertError } = await supabase
+        .schema('nota_games')
+        .from('session_participants')
+        .insert({
+          session_id:  sessionId,
+          player_id:   playerId,
+          player_name: playerName,
+          assigned_by: 'auto',
+        })
+        .select('player_name, team_id, duo_id')
+        .single();
+
+      if (insertError || !inserted) {
+        logger.error({ sessionId, playerId, err: insertError?.message }, 'failed to register participant');
+        res.status(500).json({ error: 'Failed to register player', detail: insertError?.message });
+        return;
+      }
+
+      logger.info({ sessionId, playerId, playerName }, 'participant self-registered');
+      participant = inserted;
     }
 
-    // Cache player metadata in session registry
+    // Cache player metadata in session registry (idempotent — safe on re-join)
     registerPlayer(
       sessionId,
       playerId,
@@ -76,7 +113,7 @@ sessionsRouter.post(
     getOrCreateSession(sessionId);
     subscribeToSession(sessionId);
 
-    // Track presence — dashboard sees connected players in real time
+    // Track presence
     trackPlayerPresence(
       sessionId,
       playerId,
@@ -86,24 +123,21 @@ sessionsRouter.post(
     );
 
     logger.info(
-      { sessionId, playerId, playerName: participant.player_name, teamId: participant.team_id ?? null, duoId: participant.duo_id ?? null },
-      'player joined session',
+      { sessionId, playerId, playerName: participant.player_name, isRejoin },
+      isRejoin ? 'player rejoined session' : 'player joined session',
     );
 
-    // Log player_joined event
-    await supabase
-      .schema('nota_games')
-      .from('game_events')
-      .insert({
-        session_id: sessionId,
-        player_id:  playerId,
-        event_type: 'player_joined',
-        payload: {
-          playerName: participant.player_name,
-          teamId:     participant.team_id,
-          duoId:      participant.duo_id,
-        },
-      });
+    if (!isRejoin) {
+      await supabase
+        .schema('nota_games')
+        .from('game_events')
+        .insert({
+          session_id: sessionId,
+          player_id:  playerId,
+          event_type: 'player_joined',
+          payload:    { playerName: participant.player_name },
+        });
+    }
 
     res.status(200).json({
       sessionId,
@@ -111,6 +145,7 @@ sessionsRouter.post(
       playerName: participant.player_name,
       teamId:     participant.team_id ?? null,
       duoId:      participant.duo_id  ?? null,
+      isRejoin,
     });
   },
 );

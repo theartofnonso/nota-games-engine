@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import pinoHttp from 'pino-http';
 import logger from '../lib/logger.js';
+import { authRouter } from './routes/auth.js';
 import { sessionsRouter } from './routes/sessions.js';
 import { dashboardRouter } from './routes/dashboard.js';
 
@@ -11,6 +12,8 @@ export function createServer() {
   app.use(pinoHttp({ logger }));
   app.use(cors());
   app.use(express.json({ limit: '256kb' })); // 5s batch at 20Hz ≈ 2–4kb; 256kb is generous
+
+  app.use('/auth', authRouter);
 
   // Player-facing endpoints (join, motion, leave)
   app.use('/sessions', sessionsRouter);
