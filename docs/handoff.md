@@ -4,12 +4,12 @@
 
 The backend is a Node.js/TypeScript server backed by Supabase (Postgres + Realtime). There are two client surfaces:
 
-- **Mobile app** — player-facing. Authenticates, joins a session, sends motion data in the background, receives score updates.
+- **Mobile app** — player-facing. No authentication required. Players self-register onto a session with their name, send motion data in the background, and receive score updates via Realtime.
 - **Web app** — two views:
-  - **Game controller** — instructor-facing. Creates sessions, assigns players, drives session state.
+  - **Game controller** — instructor-facing. Requires authentication. Creates sessions, manages teams, drives session state.
   - **Scoreboard** — display-only. Subscribes to live leaderboard updates.
 
-All communication is either REST (setup/control) or Supabase Realtime (live data during a session). The user interacts with the mobile app twice: once to join, once to see final results. Everything else happens in the background.
+All communication is either REST (setup/control) or Supabase Realtime (live data during a session).
 
 ---
 
@@ -27,18 +27,36 @@ Both clients need the following values (provided separately — do not commit):
 
 ## Authentication
 
-All API requests require a Supabase Auth JWT in the Authorization header:
+**Player routes** (`/sessions/...`) — no authentication required.
+
+**Dashboard routes** (`/dashboard/sessions/...`) — all require a Supabase Auth JWT in the `Authorization` header:
 
 ```
-Authorization: Bearer <supabase_access_token>
+Authorization: Bearer <access_token>
 ```
 
-Obtain the token by signing in via the Supabase client:
+Obtain the token via the login endpoint:
 
-```ts
-const { data } = await supabase.auth.signInWithPassword({ email, password });
-const jwt = data.session.access_token;
+#### POST /auth/login
+
+```json
+{ "email": "instructor@example.com", "password": "yourpassword" }
 ```
+
+Response 200:
+```json
+{
+  "accessToken": "eyJ...",
+  "expiresAt":   1700003600,
+  "user": { "id": "uuid", "email": "instructor@example.com" }
+}
+```
+
+Use `accessToken` as the `Bearer` token on all `/dashboard/sessions/...` requests.
+
+Errors:
+- 400 — missing or invalid email/password fields
+- 401 — wrong credentials
 
 ---
 
@@ -48,24 +66,32 @@ const jwt = data.session.access_token;
 
 ```
 App open
-└── Sign in → get JWT
-└── Join session (one tap)
-└── [background] subscribe to session:state events
-    ├── status = active     → start sending motion batches every 5s
-    ├── status = paused     → pause sending
-    ├── status = pass_break → pause sending (wait for active)
-    └── status = ended      → stop sending → call /leave → show results
+└── Join session with name (one tap)
+    └── Persist returned playerId to local storage
+└── [background] subscribe to session:state and session:scores channels
+└── On session_state_change:
+    ├── state.isRunning = true  → start sending motion batches every 5s
+    ├── state.isPaused  = true  → pause sending
+    ├── state.phase = 'complete' → stop sending → call /leave → show results
 ```
 
-The user interacts with the app only at join and results. Everything else is background.
+**Important:** The `playerId` returned by `/join` must be stored persistently on the device (local storage / keychain). It is required for all subsequent calls (`/motion`, `/leave`) and enables re-joining the same session after a disconnect without losing score history.
 
 ### Endpoints
 
 #### POST /sessions/:id/join
 
-Call once when the player enters a session. Returns their team/duo assignment. This is the trigger to start Realtime subscriptions.
+Self-registers the player onto the session and returns their identity. Call once on first join. Call again with the same `playerId` to re-join after a disconnect.
 
-Headers: Authorization: Bearer \<jwt\>
+No authentication required.
+
+Body:
+```json
+{
+  "playerName": "string",
+  "playerId":   "uuid (omit on first join — server generates one)"
+}
+```
 
 Response 200:
 ```json
@@ -74,22 +100,28 @@ Response 200:
   "playerId":   "uuid",
   "playerName": "string",
   "teamId":     "uuid | null",
-  "duoId":      "uuid | null"
+  "duoId":      "uuid | null",
+  "isRejoin":   false
 }
 ```
 
+Field notes:
+- `playerId` — persist this immediately. Send it in all subsequent requests.
+- `isRejoin` — true if the player was already registered (reconnect scenario). No duplicate event is logged.
+- `teamId` / `duoId` — null until the instructor runs team assignment from the controller.
+
 Errors:
-- 401 — not authenticated
-- 403 — not registered for this session (instructor must add them first)
+- 400 — missing or invalid `playerName`
+- 403 — session has already ended
+- 404 — session not found
 
 ---
 
 #### POST /sessions/:id/motion
 
-Send a batch of raw accelerometer samples every 5 seconds while the session phase is "work". Pause during any other phase. Resume when "active" is received on the state channel.
+Send a batch of raw accelerometer samples every 5 seconds while `state.isRunning` is true. Pause when `state.isPaused` is true or `state.phase` is not `'work'`.
 
-Headers: Authorization: Bearer \<jwt\>
-Content-Type: application/json
+No authentication required.
 
 Body:
 ```json
@@ -106,9 +138,9 @@ Body:
 ```
 
 Field notes:
-- sampleRateHz: device sample rate, e.g. 20 for a 50ms tick interval
-- samples: raw linear acceleration with gravity removed (m/s²), minimum 1 sample
-- x/y/z: user accelerometer values, not raw accelerometer
+- `sampleRateHz` — device sample rate, e.g. 20 for a 50ms tick interval
+- `samples` — raw linear acceleration with gravity removed (m/s²), minimum 1 sample
+- `x/y/z` — user accelerometer values, not raw accelerometer
 
 Response 202:
 ```json
@@ -116,8 +148,7 @@ Response 202:
 ```
 
 Errors:
-- 400 — invalid payload, includes field-level issues array
-- 401 — not authenticated
+- 400 — invalid payload, includes field-level `issues` array
 - 403 — not joined to this session, call /join first
 - 502 — Realtime publish failed, retry the batch
 
@@ -125,9 +156,14 @@ Errors:
 
 #### DELETE /sessions/:id/leave
 
-Call when the session ends or the player exits the app. Untracks presence and logs a player_left event.
+Call when the session ends or the player exits the app. Untracks presence and logs a `player_left` event.
 
-Headers: Authorization: Bearer \<jwt\>
+No authentication required.
+
+Body:
+```json
+{ "playerId": "uuid" }
+```
 
 Response 200:
 ```json
@@ -154,10 +190,9 @@ const scoresChannel = supabase
 const stateChannel = supabase
   .channel(`session:${sessionId}:state`)
   .on('broadcast', { event: 'session_state_change' }, ({ payload }) => {
-    if (payload.status === 'active')     startSendingMotion();
-    if (payload.status === 'paused')     pauseSendingMotion();
-    if (payload.status === 'pass_break') pauseSendingMotion();
-    if (payload.status === 'ended')      stopAndLeave();
+    if (payload.state.isRunning)              startSendingMotion();
+    if (payload.state.isPaused)               pauseSendingMotion();
+    if (payload.state.phase === 'complete')   stopAndLeave();
   })
   .subscribe();
 
@@ -196,9 +231,18 @@ interface PresenceUpdate {
 
 // session_state_change — drives all mobile background behaviour
 interface SessionStateChange {
-  sessionId: string;
-  status:    'active' | 'paused' | 'pass_break' | 'ended';
   timestamp: number;
+  state: {
+    phase:              'work' | 'rest' | 'passBreak' | 'complete';
+    currentStation:     number;
+    currentRound:       number;
+    currentPass:        number;
+    timeRemaining:      number;
+    isRunning:          boolean;
+    isPaused:           boolean;
+    completedIntervals: number;
+    totalIntervals:     number;
+  };
 }
 ```
 
@@ -210,7 +254,13 @@ interface SessionStateChange {
 
 ```
 Create session
-└── Add participants (with team/duo assignments)
+└── Players self-register via POST /sessions/:id/join (no action needed from instructor)
+└── [optional] Manually add or override a participant
+    └── POST /dashboard/sessions/:id/participants
+└── Assign teams
+    ├── Auto:          POST  /dashboard/sessions/:id/participants/assign
+    ├── Manual (bulk): PATCH /dashboard/sessions/:id/participants
+    └── Manual (one):  PATCH /dashboard/sessions/:id/participants/:participantId
 └── Start → PATCH state: active
     ├── Pause  → PATCH state: paused
     ├── Resume → PATCH state: active
@@ -219,11 +269,13 @@ Create session
 
 ### Endpoints
 
+All dashboard endpoints require: `Authorization: Bearer <jwt>`
+
+---
+
 #### POST /dashboard/sessions
 
 Create a new session before the class starts.
-
-Headers: Authorization: Bearer \<jwt\>
 
 Body:
 ```json
@@ -240,27 +292,28 @@ Body:
 }
 ```
 
-teamFormat values: "solo" | "team" | "mixed"
+`teamFormat` values: `"solo"` | `"team"` | `"mixed"`
 
-Response 201: Full session object including id — store this as sessionId.
+Response 201: Full session object including `id` — store this as `sessionId`.
 
 ---
 
 #### POST /dashboard/sessions/:id/participants
 
-Add a player to the session. Call once per player before starting. Must be called before PATCH state: active — RLS blocks new participants after that.
+Manually pre-registers a player. Use this to override a player's name or pre-assign a specific team/duo before the session starts. Players can also self-register via `POST /sessions/:id/join` — this endpoint is not required for normal flow.
 
 Body:
 ```json
 {
   "playerId":   "uuid",
   "playerName": "string",
-  "teamId":     "uuid (omit if solo)",
-  "duoId":      "uuid (omit if not in a duo)"
+  "teamId":     "uuid (optional)",
+  "duoId":      "uuid (optional)"
 }
 ```
 
 Response 201: Participant row.
+
 Errors:
 - 404 — session not found
 - 409 — session already started, or player already registered
@@ -269,7 +322,7 @@ Errors:
 
 #### GET /dashboard/sessions/:id/participants
 
-List all registered participants with team and duo names.
+List all registered participants with their resolved team and duo names.
 
 Response 200:
 ```json
@@ -283,7 +336,7 @@ Response 200:
       "team_id":     "uuid | null",
       "duo_id":      "uuid | null",
       "joined_at":   "ISO timestamp",
-      "teams":       { "name": "Team Red", "color": "#FF0000" },
+      "teams":       { "name": "Team Red" },
       "duos":        { "name": "Duo A" }
     }
   ]
@@ -292,67 +345,144 @@ Response 200:
 
 ---
 
-#### PATCH /dashboard/sessions/:id/state
+#### POST /dashboard/sessions/:id/participants/assign
 
-Transition the session. Broadcasts session_state_change to all connected clients immediately.
+Auto-assigns all unassigned participants to the session's teams using round-robin distribution (fills the smallest team first). The session must have at least one team before calling this.
+
+No body required.
+
+Response 200:
+```json
+{ "assigned": 4 }
+```
+
+Errors:
+- 409 — no teams exist for this session
+
+---
+
+#### PATCH /dashboard/sessions/:id/participants
+
+Bulk manual assignment — assign multiple participants to teams in a single request. Participants sharing the same `teamId + duoId` combination are applied in one DB write. Setting `teamId` to `null` clears both team and duo for that participant.
 
 Body:
 ```json
-{ "status": "active" }
+{
+  "assignments": [
+    { "participantId": "uuid", "teamId": "uuid", "duoId": "uuid" },
+    { "participantId": "uuid", "teamId": "uuid", "duoId": "uuid" },
+    { "participantId": "uuid", "teamId": "uuid" },
+    { "participantId": "uuid", "teamId": null }
+  ]
+}
+```
+
+Response 200:
+```json
+{
+  "assigned": 4,
+  "participants": [
+    { "id": "uuid", "playerId": "uuid", "playerName": "string", "teamId": "uuid | null", "duoId": "uuid | null" }
+  ]
+}
+```
+
+Errors:
+- 400 — any entry has `duoId` without `teamId`, or `assignments` is empty
+- 500 — DB update failed (operation is all-or-nothing)
+
+---
+
+#### PATCH /dashboard/sessions/:id/participants/:participantId
+
+Manually assigns a single participant to a specific team (and optionally a duo). Set `teamId` to `null` to remove the team assignment — this also clears any `duoId`.
+
+Body:
+```json
+{
+  "teamId": "uuid | null",
+  "duoId":  "uuid | null (optional, requires teamId)"
+}
+```
+
+Response 200:
+```json
+{
+  "id":         "uuid",
+  "playerId":   "uuid",
+  "playerName": "string",
+  "teamId":     "uuid | null",
+  "duoId":      "uuid | null"
+}
+```
+
+Errors:
+- 400 — `duoId` provided without `teamId`
+- 404 — participant not found in this session
+
+---
+
+#### PATCH /dashboard/sessions/:id/state
+
+Transitions the session state and broadcasts `session_state_change` to all connected clients. Send `phase` to trigger a full game state broadcast (required for players to start/stop motion). Send `status` alone for simple start/end transitions.
+
+Body:
+```json
+{
+  "status":           "active | paused | ended (optional)",
+  "phase":            "work | rest | passBreak | complete (optional)",
+  "currentStation":   1,
+  "currentRound":     1,
+  "currentPass":      1,
+  "timeRemaining":    40,
+  "isRunning":        true,
+  "isPaused":         false,
+  "completedIntervals": 0,
+  "totalIntervals":   18
+}
 ```
 
 Transition reference:
 - Start session:           `{ "status": "active" }`
-- Pause:                   `{ "status": "paused" }`
-- Resume after pause:      `{ "status": "active" }`
-- Resume after pass break: `{ "status": "active" }`
+- Begin work interval:     `{ "status": "active", "phase": "work", "isRunning": true, ... }`
+- Pause mid-interval:      `{ "status": "paused", "phase": "work", "isPaused": true, ... }`
+- Resume after pause:      `{ "status": "active", "phase": "work", "isRunning": true, ... }`
 - End session:             `{ "status": "ended" }`
 
 Response 200:
 ```json
 {
-  "id":        "uuid",
-  "status":    "active",
-  "startedAt": "ISO timestamp | null",
-  "endedAt":   "ISO timestamp | null"
+  "updated":   true,
+  "gameState": { "timestamp": 1700000000000, "state": { ... } }
 }
 ```
 
----
-
-#### GET /dashboard/sessions/:id
-
-Fetch full session details including current phase and pass.
-
-Response 200: Full session object.
+`gameState` is `null` when no `phase` was included in the request.
 
 ---
 
 #### GET /dashboard/sessions/:id/leaderboard
 
-Fetch the current leaderboard. Add ?pass=N for per-pass rankings. Omit for overall.
+Fetch the current leaderboard. Add `?pass=N` for per-pass rankings. Omit for overall.
 
 Response 200:
 ```json
 {
   "sessionId": "uuid",
   "pass":      null,
-  "updatedAt": 1700000000000,
-  "entries": [
+  "leaderboard": [
     {
       "rank":            1,
-      "playerId":        "uuid",
-      "playerName":      "string",
-      "teamId":          "uuid | null",
-      "teamName":        "string | null",
-      "duoId":           "uuid | null",
-      "duoName":         "string | null",
-      "totalXp":         342.5,
-      "overallRank":     1,
-      "duoTotalXp":      610.2,
-      "duoRank":         1,
-      "passXp":          0,
-      "currentPassRank": null
+      "player_id":       "uuid",
+      "player_name":     "string",
+      "team_id":         "uuid | null",
+      "duo_id":          "uuid | null",
+      "total_xp":        342.5,
+      "overall_rank":    1,
+      "duo_total_xp":    610.2,
+      "duo_rank":        1,
+      "pass_xp":         0,
+      "current_pass_rank": null
     }
   ]
 }
@@ -366,7 +496,7 @@ Response 200:
 const stateChannel = supabase
   .channel(`session:${sessionId}:state`)
   .on('broadcast', { event: 'session_state_change' }, ({ payload }) => {
-    updateControllerUI(payload.status);
+    updateControllerUI(payload.state);
   })
   .subscribe();
 ```
@@ -384,7 +514,7 @@ const res  = await fetch(`${SERVER_URL}/dashboard/sessions/${sessionId}/leaderbo
   headers: { Authorization: `Bearer ${jwt}` },
 });
 const data = await res.json();
-renderLeaderboard(data.entries);
+renderLeaderboard(data.leaderboard);
 ```
 
 ### Live updates
@@ -442,7 +572,7 @@ All errors:
 }
 ```
 
-Validation errors (400) include an issues array:
+Validation errors (400) include an `issues` array:
 ```json
 {
   "error": "Invalid request body",
