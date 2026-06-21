@@ -564,15 +564,10 @@ dashboardRouter.patch(
 
       if (!stateChannel) {
         stateChannel = supabase.channel(getChannelName('state', sessionId));
-        stateChannel.subscribe();
         setChannel(sessionId, 'state', stateChannel);
       }
 
-      await stateChannel.send({
-        type:    'broadcast',
-        event:   'session_state_change',
-        payload: gameState,
-      });
+      await stateChannel.httpSend('session_state_change', gameState);
 
       logger.info({ sessionId, phase: gameState.state.phase, status: body.status ?? null }, 'session_state_change broadcast');
     }
