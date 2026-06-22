@@ -167,7 +167,7 @@ sessionsRouter.post(
 
     await scoreAndBroadcast(sessionId, batch);
 
-    logger.debug({ sessionId, playerId: batch.playerId, sampleCount: batch.samples.length, batchStartedAt: batch.batchStartedAt }, 'motion batch processed');
+    logger.info({ sessionId, batch }, 'motion batch received');
     res.status(202).json({ received: true, batchStartedAt: batch.batchStartedAt });
   },
 );
