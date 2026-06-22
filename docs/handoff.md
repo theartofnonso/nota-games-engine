@@ -153,7 +153,6 @@ Response 202:
 Errors:
 - 400 — invalid payload, includes field-level `issues` array
 - 403 — not joined to this session, call /join first
-- 502 — Realtime publish failed, retry the batch
 
 ---
 
@@ -568,10 +567,11 @@ The leaderboard updates automatically after every motion batch (~5 seconds per a
 
 | Channel | Publisher | Subscribers | Events |
 |---|---|---|---|
-| `session:{id}:motion` | Mobile app | Game Engine | `motion_batch` |
-| `session:{id}:scores` | Game Engine | Mobile + Scoreboard + Controller | `leaderboard_update`, `presence_update` |
-| `session:{id}:state` | Game controller | Mobile + Scoreboard + Game Engine | `session_state_change` |
+| `session:{id}:scores` | Game Engine (via REST broadcast) | Mobile + Scoreboard + Controller | `leaderboard_update`, `presence_update` |
+| `session:{id}:state` | Game controller (via REST broadcast) | Mobile + Scoreboard + Game Engine | `session_state_change` |
 | `session:{id}:presence` | Mobile app (each device tracks itself) | Game Engine (listener) | Supabase Presence sync/join/leave |
+
+> **Motion batches are not sent over Realtime.** The mobile app posts batches directly to `POST /sessions/:id/motion` (HTTP). The server scores each batch synchronously and then broadcasts the updated leaderboard to `session:{id}:scores`. There is no `session:{id}:motion` Realtime channel.
 
 > **Note:** Each mobile client tracks its own presence on `session:{id}:presence`.
 > The server listens to that channel and re-broadcasts the full connected-player list

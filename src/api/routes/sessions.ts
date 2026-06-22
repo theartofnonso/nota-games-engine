@@ -3,8 +3,7 @@ import type { Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { supabase } from '../../lib/supabase.js';
-import { getChannelName } from '../../realtime/channels.js';
-import { subscribeToSession } from '../../realtime/motion-subscriber.js';
+import { subscribeToSession, scoreAndBroadcast } from '../../realtime/motion-subscriber.js';
 import logger from '../../lib/logger.js';
 import {
   getOrCreateSession,
@@ -166,22 +165,9 @@ sessionsRouter.post(
       return;
     }
 
-    // Reuse the channel already held in the registry — avoids creating and
-    // abandoning a new Supabase channel object on every motion batch request.
-    const motionChannel = session.motionChannel ?? supabase.channel(getChannelName('motion', sessionId));
-    const sendError = await motionChannel.send({
-      type:    'broadcast',
-      event:   'motion_batch',
-      payload: batch,
-    });
+    await scoreAndBroadcast(sessionId, batch);
 
-    if (sendError !== 'ok') {
-      logger.error({ sessionId, playerId: batch.playerId, sendError }, 'failed to publish motion batch');
-      res.status(502).json({ error: 'Failed to publish motion batch to realtime' });
-      return;
-    }
-
-    logger.debug({ sessionId, playerId: batch.playerId, sampleCount: batch.samples.length, batchStartedAt: batch.batchStartedAt }, 'motion batch published');
+    logger.debug({ sessionId, playerId: batch.playerId, sampleCount: batch.samples.length, batchStartedAt: batch.batchStartedAt }, 'motion batch processed');
     res.status(202).json({ received: true, batchStartedAt: batch.batchStartedAt });
   },
 );

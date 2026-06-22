@@ -7,7 +7,6 @@ interface SessionRecord {
   gameState:       RuntimeGameState | null;
   // player metadata needed for leaderboard broadcasts
   players:         Map<string, { playerName: string; teamId?: string; duoId?: string }>;
-  motionChannel:   ReturnType<typeof supabase.channel> | null;
   scoresChannel:   ReturnType<typeof supabase.channel> | null;
   stateChannel:    ReturnType<typeof supabase.channel> | null;
   presenceChannel: ReturnType<typeof supabase.channel> | null;
@@ -21,7 +20,6 @@ export function getOrCreateSession(sessionId: string): SessionRecord {
       engine:          new SessionEngine(),
       gameState:       null,
       players:         new Map(),
-      motionChannel:   null,
       scoresChannel:   null,
       stateChannel:    null,
       presenceChannel: null,
@@ -82,7 +80,6 @@ export async function cleanupSession(sessionId: string): Promise<void> {
   if (!session) return;
 
   const channels = [
-    session.motionChannel,
     session.scoresChannel,
     session.stateChannel,
     session.presenceChannel,
@@ -94,11 +91,10 @@ export async function cleanupSession(sessionId: string): Promise<void> {
 
 export function setChannel(
   sessionId: string,
-  type: 'motion' | 'scores' | 'state' | 'presence',
+  type: 'scores' | 'state' | 'presence',
   channel: ReturnType<typeof supabase.channel>,
 ): void {
   const session = getOrCreateSession(sessionId);
-  if (type === 'motion')   session.motionChannel   = channel;
   if (type === 'scores')   session.scoresChannel   = channel;
   if (type === 'state')    session.stateChannel    = channel;
   if (type === 'presence') session.presenceChannel = channel;
