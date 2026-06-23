@@ -5,7 +5,6 @@ export interface PlayerPresence {
   playerId:   string;
   playerName: string;
   teamId:     string | null;
-  duoId:      string | null;
   joinedAt:   number; // ms since epoch
 }
 

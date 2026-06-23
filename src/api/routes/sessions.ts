@@ -22,17 +22,12 @@ sessionsRouter.param('id', validateUUIDParam);
 // ─── POST /sessions/:id/join ──────────────────────────────────────────────────
 // Self-registration + join in one step. No auth required.
 //
-// First-time join: player sends { playerName } and optionally a client-generated
-// { playerId } UUID. Server registers them as a participant and returns the
-// playerId. The mobile app should persist this UUID and send it on every
-// subsequent call (motion batches, re-joins, leave).
+// First-time join: assigns the player to whichever of the session's two teams
+// has fewer members, then returns the assignment. The mobile app should persist
+// playerId and use it on every subsequent call (/motion, /leave, re-join).
 //
-// Re-join (disconnect/reconnect): player sends the same { playerId } they
-// received on first join. Server finds the existing participant record and
-// re-activates the session subscription and presence tracking.
-//
-// Team assignment is NOT done here — the instructor triggers it separately
-// from the dashboard after all players have joined.
+// Re-join (disconnect/reconnect): sends the same { playerId } received on first
+// join. Existing team assignment is preserved.
 
 const JoinSessionSchema = z.object({
   playerName: z.string().min(1),
@@ -43,7 +38,7 @@ sessionsRouter.post(
   '/:id/join',
   validate(JoinSessionSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const sessionId  = req.params.id as string;
+    const sessionId = req.params.id as string;
     const { playerName, playerId: clientPlayerId } = req.body as z.infer<typeof JoinSessionSchema>;
 
     // Confirm the session exists and is joinable
@@ -70,13 +65,13 @@ sessionsRouter.post(
     const { data: existing } = await supabase
       .schema('nota_games')
       .from('session_participants')
-      .select('player_name, team_id, duo_id')
+      .select('player_name, team_id')
       .eq('session_id', sessionId)
       .eq('player_id', playerId)
       .single();
 
     let participant = existing;
-    let isRejoin    = !!existing;
+    const isRejoin  = !!existing;
 
     if (!participant) {
       // First-time join — self-register
@@ -89,7 +84,7 @@ sessionsRouter.post(
           player_name: playerName,
           assigned_by: 'auto',
         })
-        .select('player_name, team_id, duo_id')
+        .select('player_name, team_id')
         .single();
 
       if (insertError || !inserted) {
@@ -102,21 +97,53 @@ sessionsRouter.post(
       participant = inserted;
     }
 
+    // Auto team assignment — only for first join and only when no team yet
+    let teamId: string | undefined = participant.team_id ?? undefined;
+
+    if (!isRejoin && !teamId) {
+      const { data: teams } = await supabase
+        .schema('nota_games')
+        .from('teams')
+        .select('id')
+        .eq('session_id', sessionId);
+
+      if (teams && teams.length > 0) {
+        // Count current members per team to find the smallest
+        const { data: members } = await supabase
+          .schema('nota_games')
+          .from('session_participants')
+          .select('team_id')
+          .eq('session_id', sessionId)
+          .not('team_id', 'is', null);
+
+        const counts = new Map<string, number>(teams.map((t) => [t.id as string, 0]));
+        for (const m of members ?? []) {
+          if (m.team_id) counts.set(m.team_id, (counts.get(m.team_id) ?? 0) + 1);
+        }
+
+        const [assignedTeamId] = [...counts.entries()].sort((a, b) => a[1] - b[1])[0]!;
+
+        await supabase
+          .schema('nota_games')
+          .from('session_participants')
+          .update({ team_id: assignedTeamId, assigned_by: 'auto' })
+          .eq('session_id', sessionId)
+          .eq('player_id', playerId);
+
+        teamId = assignedTeamId;
+        logger.info({ sessionId, playerId, teamId }, 'player auto-assigned to team');
+      }
+    }
+
     // Cache player metadata in session registry (idempotent — safe on re-join)
-    registerPlayer(
-      sessionId,
-      playerId,
-      participant.player_name,
-      participant.team_id ?? undefined,
-      participant.duo_id  ?? undefined,
-    );
+    registerPlayer(sessionId, playerId, participant.player_name, teamId);
 
     // Ensure realtime subscription is active for this session (idempotent)
     const sessionRecord = getOrCreateSession(sessionId);
     subscribeToSession(sessionId);
 
     logger.info(
-      { sessionId, playerId, playerName: participant.player_name, isRejoin },
+      { sessionId, playerId, playerName: participant.player_name, teamId: teamId ?? null, isRejoin },
       isRejoin ? 'player rejoined session' : 'player joined session',
     );
 
@@ -136,20 +163,16 @@ sessionsRouter.post(
       sessionId,
       playerId,
       playerName: participant.player_name,
-      teamId:     participant.team_id ?? null,
-      duoId:      participant.duo_id  ?? null,
+      teamId:     teamId ?? null,
       isRejoin,
-      // Current game state — non-null only when the session is already running.
-      // Late joiners and re-joiners should check this and start motion immediately
-      // if isRunning is true, rather than waiting for the next state broadcast.
-      gameState: sessionRecord.gameState ?? null,
+      gameState:  sessionRecord.gameState ?? null,
     });
   },
 );
 
 // ─── POST /sessions/:id/motion ────────────────────────────────────────────────
-// Receives a PlayerMotionBatch from the mobile app and publishes it
-// to the session:motion realtime channel.
+// Receives a PlayerMotionBatch from the mobile app, scores it immediately,
+// and broadcasts the updated leaderboard to session:{id}:scores.
 
 sessionsRouter.post(
   '/:id/motion',

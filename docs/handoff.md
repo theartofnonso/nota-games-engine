@@ -6,7 +6,7 @@ The backend is a Node.js/TypeScript server backed by Supabase (Postgres + Realti
 
 - **Mobile app** — player-facing. No authentication required. Players self-register onto a session with their name, send motion data in the background, and receive score updates via Realtime.
 - **Web app** — two views:
-  - **Game controller** — instructor-facing. Requires authentication. Creates sessions, manages teams, drives session state.
+  - **Game controller** — instructor-facing. Requires authentication. Creates sessions, drives session state.
   - **Scoreboard** — display-only. Subscribes to live leaderboard updates.
 
 All communication is either REST (setup/control) or Supabase Realtime (live data during a session).
@@ -68,6 +68,7 @@ Errors:
 App open
 └── Join session with name (one tap)
     └── Persist returned playerId to local storage
+    └── Server auto-assigns player to Red or Blue team
     └── If gameState.state.sensorActive = true → start sending motion batches immediately
 └── [background] subscribe to session:state and session:scores channels
 └── On session_state_change:
@@ -82,7 +83,7 @@ App open
 
 #### POST /sessions/:id/join
 
-Self-registers the player onto the session and returns their identity. Call once on first join. Call again with the same `playerId` to re-join after a disconnect.
+Self-registers the player onto the session and auto-assigns them to the smaller of the two teams (Red or Blue). Call once on first join. Call again with the same `playerId` to re-join after a disconnect — existing team assignment is preserved.
 
 No authentication required.
 
@@ -101,7 +102,6 @@ Response 200:
   "playerId":   "uuid",
   "playerName": "string",
   "teamId":     "uuid | null",
-  "duoId":      "uuid | null",
   "isRejoin":   false,
   "gameState":  null
 }
@@ -109,8 +109,8 @@ Response 200:
 
 Field notes:
 - `playerId` — persist this immediately. Send it in all subsequent requests.
+- `teamId` — set immediately on first join via auto-assignment. Null only if the session has no teams configured.
 - `isRejoin` — true if the player was already registered (reconnect scenario). No duplicate event is logged.
-- `teamId` / `duoId` — null until the instructor runs team assignment from the controller.
 - `gameState` — the current `SessionStateChange` payload if the session is already running, or `null` if it hasn't started yet. **Check this immediately after joining.** If `gameState.state.sensorActive` is true, start sending motion batches right away — do not wait for the first `session_state_change` broadcast.
 
 Errors:
@@ -205,7 +205,7 @@ const presenceChannel = supabase
   .channel(`session:${sessionId}:presence`)
   .subscribe(async (status) => {
     if (status === 'SUBSCRIBED') {
-      await presenceChannel.track({ playerId, playerName, teamId, duoId, joinedAt: Date.now() });
+      await presenceChannel.track({ playerId, playerName, teamId, joinedAt: Date.now() });
     }
   });
 
@@ -239,7 +239,6 @@ interface PresenceUpdate {
     playerId:   string;
     playerName: string;
     teamId:     string | null;
-    duoId:      string | null;
     joinedAt:   number;
   }[];
 }
@@ -273,14 +272,10 @@ interface SessionStateChange {
 ### Session lifecycle
 
 ```
-Create session
-└── Players self-register via POST /sessions/:id/join (no action needed from instructor)
-└── [optional] Manually add or override a participant
+Create session  (auto-creates Red and Blue teams)
+└── Players self-register and are auto-assigned to a team via POST /sessions/:id/join
+└── [optional] Manually pre-register a participant
     └── POST /dashboard/sessions/:id/participants
-└── Assign teams
-    ├── Auto:          POST  /dashboard/sessions/:id/participants/assign
-    ├── Manual (bulk): PATCH /dashboard/sessions/:id/participants
-    └── Manual (one):  PATCH /dashboard/sessions/:id/participants/:participantId
 └── Start → PATCH state: active
     ├── Pause  → PATCH state: paused
     ├── Resume → PATCH state: active
@@ -295,7 +290,7 @@ All dashboard endpoints require: `Authorization: Bearer <jwt>`
 
 #### POST /dashboard/sessions
 
-Create a new session before the class starts.
+Create a new session. Automatically creates **Red** and **Blue** teams for the session — no additional setup required before players join.
 
 Body:
 ```json
@@ -320,15 +315,13 @@ Response 201: Full session object including `id` — store this as `sessionId`.
 
 #### POST /dashboard/sessions/:id/participants
 
-Manually pre-registers a player. Use this to override a player's name or pre-assign a specific team/duo before the session starts. Players can also self-register via `POST /sessions/:id/join` — this endpoint is not required for normal flow.
+Manually pre-registers a player before they join. Team assignment happens automatically when the player calls `/join` — not here.
 
 Body:
 ```json
 {
   "playerId":   "uuid",
-  "playerName": "string",
-  "teamId":     "uuid (optional)",
-  "duoId":      "uuid (optional)"
+  "playerName": "string"
 }
 ```
 
@@ -342,7 +335,7 @@ Errors:
 
 #### GET /dashboard/sessions/:id/participants
 
-List all registered participants with their resolved team and duo names.
+List all registered participants with their resolved team name.
 
 Response 200:
 ```json
@@ -354,91 +347,12 @@ Response 200:
       "player_id":   "uuid",
       "player_name": "string",
       "team_id":     "uuid | null",
-      "duo_id":      "uuid | null",
       "joined_at":   "ISO timestamp",
-      "teams":       { "name": "Team Red" },
-      "duos":        { "name": "Duo A" }
+      "teams":       { "name": "Red" }
     }
   ]
 }
 ```
-
----
-
-#### POST /dashboard/sessions/:id/participants/assign
-
-Auto-assigns all unassigned participants to the session's teams using round-robin distribution (fills the smallest team first). The session must have at least one team before calling this.
-
-No body required.
-
-Response 200:
-```json
-{ "assigned": 4 }
-```
-
-Errors:
-- 409 — no teams exist for this session
-
----
-
-#### PATCH /dashboard/sessions/:id/participants
-
-Bulk manual assignment — assign multiple participants to teams in a single request. Participants sharing the same `teamId + duoId` combination are applied in one DB write. Setting `teamId` to `null` clears both team and duo for that participant.
-
-Body:
-```json
-{
-  "assignments": [
-    { "participantId": "uuid", "teamId": "uuid", "duoId": "uuid" },
-    { "participantId": "uuid", "teamId": "uuid", "duoId": "uuid" },
-    { "participantId": "uuid", "teamId": "uuid" },
-    { "participantId": "uuid", "teamId": null }
-  ]
-}
-```
-
-Response 200:
-```json
-{
-  "assigned": 4,
-  "participants": [
-    { "id": "uuid", "playerId": "uuid", "playerName": "string", "teamId": "uuid | null", "duoId": "uuid | null" }
-  ]
-}
-```
-
-Errors:
-- 400 — any entry has `duoId` without `teamId`, or `assignments` is empty
-- 500 — DB update failed; assignments in earlier groups may have already been applied
-
----
-
-#### PATCH /dashboard/sessions/:id/participants/:participantId
-
-Manually assigns a single participant to a specific team (and optionally a duo). Set `teamId` to `null` to remove the team assignment — this also clears any `duoId`.
-
-Body:
-```json
-{
-  "teamId": "uuid | null",
-  "duoId":  "uuid | null (optional, requires teamId)"
-}
-```
-
-Response 200:
-```json
-{
-  "id":         "uuid",
-  "playerId":   "uuid",
-  "playerName": "string",
-  "teamId":     "uuid | null",
-  "duoId":      "uuid | null"
-}
-```
-
-Errors:
-- 400 — `duoId` provided without `teamId`
-- 404 — participant not found in this session
 
 ---
 
@@ -498,11 +412,8 @@ Response 200:
       "player_id":       "uuid",
       "player_name":     "string",
       "team_id":         "uuid | null",
-      "duo_id":          "uuid | null",
       "total_xp":        342.5,
       "overall_rank":    1,
-      "duo_total_xp":    610.2,
-      "duo_rank":        1,
       "pass_xp":         0,
       "current_pass_rank": null
     }
@@ -518,12 +429,10 @@ Response 200:
 const stateChannel = supabase
   .channel(`session:${sessionId}:state`)
   .on('broadcast', { event: 'session_state_change' }, ({ payload }) => {
-    // Sensor client — only these two fields needed
     if (payload.state.sensorActive) startSendingMotion();
     else                            stopSendingMotion();
     if (payload.state.sessionEnded) leaveSession();
 
-    // Controller / scoreboard UI — full state available
     updateControllerUI(payload.state);
   })
   .subscribe();
@@ -571,13 +480,7 @@ The leaderboard updates automatically after every motion batch (~5 seconds per a
 | `session:{id}:state` | Game controller (via REST broadcast) | Mobile + Scoreboard + Game Engine | `session_state_change` |
 | `session:{id}:presence` | Mobile app (each device tracks itself) | Game Engine (listener) | Supabase Presence sync/join/leave |
 
-> **Motion batches are not sent over Realtime.** The mobile app posts batches directly to `POST /sessions/:id/motion` (HTTP). The server scores each batch synchronously and then broadcasts the updated leaderboard to `session:{id}:scores`. There is no `session:{id}:motion` Realtime channel.
-
-> **Note:** Each mobile client tracks its own presence on `session:{id}:presence`.
-> The server listens to that channel and re-broadcasts the full connected-player list
-> to `session:{id}:scores` as `presence_update` events on every join or leave —
-> including automatic disconnects detected when a device's WebSocket drops.
-> The controller subscribes only to `session:{id}:scores` for both scores and presence.
+> **Motion batches are not sent over Realtime.** The mobile app posts batches directly to `POST /sessions/:id/motion` (HTTP). The server scores each batch synchronously and broadcasts the updated leaderboard to `session:{id}:scores`. There is no `session:{id}:motion` Realtime channel.
 
 ---
 

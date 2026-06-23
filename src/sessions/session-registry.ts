@@ -5,8 +5,7 @@ import { supabase } from '../lib/supabase.js';
 interface SessionRecord {
   engine:          SessionEngine;
   gameState:       RuntimeGameState | null;
-  // player metadata needed for leaderboard broadcasts
-  players:         Map<string, { playerName: string; teamId?: string; duoId?: string }>;
+  players:         Map<string, { playerName: string; teamId?: string }>;
   scoresChannel:   ReturnType<typeof supabase.channel> | null;
   stateChannel:    ReturnType<typeof supabase.channel> | null;
   presenceChannel: ReturnType<typeof supabase.channel> | null;
@@ -32,49 +31,29 @@ export function getSession(sessionId: string): SessionRecord | undefined {
   return sessions.get(sessionId);
 }
 
-export function updateGameState(
-  sessionId: string,
-  state: RuntimeGameState
-): void {
+export function updateGameState(sessionId: string, state: RuntimeGameState): void {
   const session = getOrCreateSession(sessionId);
   session.gameState = state;
 }
 
 export function registerPlayer(
-  sessionId: string,
-  playerId: string,
+  sessionId:  string,
+  playerId:   string,
   playerName: string,
-  teamId?: string,
-  duoId?: string
+  teamId?:    string,
 ): void {
   const session = getOrCreateSession(sessionId);
-  session.players.set(playerId, { playerName, teamId, duoId });
+  session.players.set(playerId, { playerName, teamId });
 }
 
 export function removePlayer(sessionId: string, playerId: string): void {
   sessions.get(sessionId)?.players.delete(playerId);
 }
 
-export function updatePlayerTeam(
-  sessionId: string,
-  playerId:  string,
-  teamId:    string | undefined,
-  duoId:     string | undefined,
-): void {
-  const session = sessions.get(sessionId);
-  if (!session) return;
-  const player = session.players.get(playerId);
-  if (!player) return;
-  session.players.set(playerId, { ...player, teamId, duoId });
-}
-
 export function removeSession(sessionId: string): void {
   sessions.delete(sessionId);
 }
 
-// Unsubscribes all Realtime channels for a session and removes it from the
-// registry. Call this after the final session_state_change broadcast so that
-// subsequent motion batches are rejected (no players in the new empty record).
 export async function cleanupSession(sessionId: string): Promise<void> {
   const session = sessions.get(sessionId);
   if (!session) return;
