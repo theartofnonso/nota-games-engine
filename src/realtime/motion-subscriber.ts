@@ -47,7 +47,6 @@ export async function scoreAndBroadcast(
     p_player_id:    batch.playerId,
     p_player_name:  batch.playerName,
     p_team_id:      session.players.get(batch.playerId)?.teamId ?? null,
-    p_duo_id:       session.players.get(batch.playerId)?.duoId  ?? null,
     p_xp_delta:     xpDelta,
     p_current_pass: state.currentPass,
   });
