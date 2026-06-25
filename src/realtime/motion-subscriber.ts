@@ -1,7 +1,6 @@
 import { supabase } from '../lib/supabase.js';
 import { getChannelName } from './channels.js';
 import logger from '../lib/logger.js';
-import { scoreBatch } from '../game/scoring.js';
 import { subscribeToPresence } from './presence.js';
 import {
   getOrCreateSession,
@@ -33,11 +32,11 @@ export async function scoreAndBroadcast(
   // Register player metadata on first sight (idempotent)
   registerPlayer(sessionId, batch.playerId, batch.playerName);
 
-  // Score the batch — returns 0 during rest/passBreak/complete or while paused
-  const xpDelta = state.isPaused ? 0 : scoreBatch(batch, state.phase);
-
-  // Update in-memory engine
-  session.engine.updatePlayer(batch.playerId, xpDelta);
+  // Run the full scoring pipeline. Skip entirely when paused so window
+  // history is frozen — scores resume from the same level on unpause.
+  const xpDelta = state.isPaused
+    ? 0
+    : session.engine.processMotionBatch(batch.playerId, batch, state.phase);
   const totalXp = session.engine.getPlayerXp(batch.playerId);
   logger.debug({ sessionId, playerId: batch.playerId, xpDelta, totalXp, phase: state.phase }, 'motion batch scored');
 
