@@ -14,10 +14,10 @@ const WINDOW_HISTORY_SIZE = 4;
 
 // Scales smoothed RMS (m/s²) into XP.
 // At 1.5 m/s² smoothed RMS → 75 XP/window; at 3 m/s² → caps out.
-const XP_MULTIPLIER = 50;
+const XP_MULTIPLIER = 10;
 
 // Hard ceiling per 5-second window regardless of effort.
-const MAX_XP_PER_WINDOW = 150;
+const MAX_XP_PER_WINDOW = 30;
 
 export { WINDOW_HISTORY_SIZE };
 
