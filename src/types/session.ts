@@ -39,11 +39,20 @@ export interface ScoredBatch {
   timestamp: number;
 }
 
+export interface TeamScore {
+  teamId: string;
+  totalXp: number;
+}
+
 // Payload broadcast on session:{id}:scores
+// Individual total_xp values and team totalXp are both normalized so the
+// leading team always shows ≤ 1000 XP regardless of raw accumulation.
 export interface ScoresBroadcastPayload {
   sessionId: string;
   updatedAt: number;
+  teams: TeamScore[];
   leaderboard: (LeaderboardEntry & {
     playerName: string;
+    teamId: string | null;
   })[];
 }

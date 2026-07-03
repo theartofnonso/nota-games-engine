@@ -9,7 +9,7 @@ import {
   setChannel,
 } from '../sessions/session-registry.js';
 import type { PlayerMotionBatch } from '../types/motion.js';
-import type { RuntimeGameState, ScoresBroadcastPayload } from '../types/session.js';
+import type { RuntimeGameState, ScoresBroadcastPayload, TeamScore } from '../types/session.js';
 
 // Scores a motion batch and broadcasts the updated leaderboard.
 // Called directly by the POST /sessions/:id/motion HTTP handler — there is no
@@ -79,17 +79,42 @@ export async function scoreAndBroadcast(
     });
 
   // Broadcast updated leaderboard to session:{id}:scores
-  const leaderboard = session.engine.getLeaderboard().map((entry) => {
+  // Enrich engine entries with player metadata from the registry
+  const rawLeaderboard = session.engine.getLeaderboard().map((entry) => {
     const meta = session.players.get(entry.playerId);
     return {
       ...entry,
       playerName: meta?.playerName ?? 'Unknown',
+      teamId:     meta?.teamId ?? null,
     };
   });
+
+  // Sum raw XP per team
+  const teamTotals = new Map<string, number>();
+  for (const entry of rawLeaderboard) {
+    if (entry.teamId) {
+      teamTotals.set(entry.teamId, (teamTotals.get(entry.teamId) ?? 0) + entry.total_xp);
+    }
+  }
+
+  // Normalize: leading team is scaled to exactly 1000; all others scale proportionally.
+  // If no team exceeds 1000 the scale factor stays 1 (scores are shown as-is).
+  const maxTeamXp = teamTotals.size > 0 ? Math.max(...teamTotals.values()) : 0;
+  const scale = maxTeamXp > 1000 ? 1000 / maxTeamXp : 1;
+
+  const leaderboard = rawLeaderboard.map((entry) => ({
+    ...entry,
+    total_xp: Math.round(entry.total_xp * scale),
+  }));
+
+  const teams: TeamScore[] = Array.from(teamTotals.entries())
+    .map(([teamId, totalXp]) => ({ teamId, totalXp: Math.round(totalXp * scale) }))
+    .sort((a, b) => b.totalXp - a.totalXp);
 
   const scoresPayload: ScoresBroadcastPayload = {
     sessionId,
     updatedAt: Date.now(),
+    teams,
     leaderboard,
   };
 
