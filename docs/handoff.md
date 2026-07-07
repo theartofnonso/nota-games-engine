@@ -101,7 +101,11 @@ Response 200:
   "sessionId":  "uuid",
   "playerId":   "uuid",
   "playerName": "string",
-  "teamId":     "uuid | null",
+  "team": {
+    "id":    "uuid",
+    "name":  "Red",
+    "color": "#EF4444"
+  },
   "isRejoin":   false,
   "gameState":  null
 }
@@ -109,7 +113,7 @@ Response 200:
 
 Field notes:
 - `playerId` — persist this immediately. Send it in all subsequent requests.
-- `teamId` — set immediately on first join via auto-assignment. Null only if the session has no teams configured.
+- `team` — assigned immediately on first join via auto-assignment. `null` only if the session has no teams configured. `color` is a hex string (e.g. `#EF4444` for Red, `#3B82F6` for Blue) — use directly for UI tinting.
 - `isRejoin` — true if the player was already registered (reconnect scenario). No duplicate event is logged.
 - `gameState` — the current `SessionStateChange` payload if the session is already running, or `null` if it hasn't started yet. **Check this immediately after joining.** If `gameState.state.sensorActive` is true, start sending motion batches right away — do not wait for the first `session_state_change` broadcast.
 
@@ -205,7 +209,14 @@ const presenceChannel = supabase
   .channel(`session:${sessionId}:presence`)
   .subscribe(async (status) => {
     if (status === 'SUBSCRIBED') {
-      await presenceChannel.track({ playerId, playerName, teamId, joinedAt: Date.now() });
+      await presenceChannel.track({
+        playerId,
+        playerName,
+        teamId:    team?.id    ?? null,
+        teamName:  team?.name  ?? null,
+        teamColor: team?.color ?? null,
+        joinedAt:  Date.now(),
+      });
     }
   });
 
@@ -220,13 +231,24 @@ await supabase.removeChannel(stateChannel);
 
 ```ts
 // leaderboard_update — emitted after every scored motion batch
+// All XP values are normalized: the leading team is always scaled to exactly 1000
+// when its raw total exceeds 1000. All other teams scale proportionally.
+// Raw (un-normalized) totals are stored in the database and available via
+// GET /dashboard/sessions/:id/leaderboard.
 interface LeaderboardUpdate {
-  sessionId:   string;
-  updatedAt:   number;
+  sessionId: string;
+  updatedAt: number;
+  teams: {
+    teamId:  string;
+    name:    string;   // e.g. "Red", "Blue"
+    color:   string;   // hex color, e.g. "#EF4444"
+    totalXp: number;   // normalized team total (≤ 1000)
+  }[];
   leaderboard: {
     playerId:   string;
     playerName: string;
-    total_xp:   number;
+    teamId:     string | null;
+    total_xp:   number;   // normalized individual XP
     rank:       number;
   }[];
 }
@@ -290,7 +312,7 @@ All dashboard endpoints require: `Authorization: Bearer <jwt>`
 
 #### POST /dashboard/sessions
 
-Create a new session. Automatically creates **Red** and **Blue** teams for the session — no additional setup required before players join.
+Create a new session. Automatically creates **Red** (`#EF4444`) and **Blue** (`#3B82F6`) teams for the session — no additional setup required before players join.
 
 Body:
 ```json
@@ -348,7 +370,7 @@ Response 200:
       "player_name": "string",
       "team_id":     "uuid | null",
       "joined_at":   "ISO timestamp",
-      "teams":       { "name": "Red" }
+      "teams":       { "name": "Red", "color": "#EF4444" }
     }
   ]
 }
@@ -481,6 +503,27 @@ The leaderboard updates automatically after every motion batch (~5 seconds per a
 | `session:{id}:presence` | Mobile app (each device tracks itself) | Game Engine (listener) | Supabase Presence sync/join/leave |
 
 > **Motion batches are not sent over Realtime.** The mobile app posts batches directly to `POST /sessions/:id/motion` (HTTP). The server scores each batch synchronously and broadcasts the updated leaderboard to `session:{id}:scores`. There is no `session:{id}:motion` Realtime channel.
+
+---
+
+## Scoring
+
+Each motion batch is run through a fixed pipeline on the server. No client-side scoring happens.
+
+```
+Raw accelerometer samples (x, y, z)
+  → Vector magnitude per sample: √(x² + y² + z²)
+  → Low-pass IIR filter (α = 0.3): removes jitter, preserves 0–3 Hz movement signal
+  → RMS over the 5-second window: measures sustained effort energy
+  → Moving average over last 4 windows (20 s): scores build and fall naturally
+  → XP = min(smoothedRms × 10, 30)   ← per window ceiling: 30 XP
+```
+
+At full sustained effort a player earns ~30 XP per 5-second window, topping out at roughly 360 XP over a 2-minute pass.
+
+**Normalization** — before broadcasting, team totals are computed and checked against a 1000 XP ceiling. If any team exceeds 1000, all individual and team XP values are scaled down proportionally so the leading team shows exactly 1000. Scores stored in the database are always raw (un-normalized).
+
+**Pausing** — when `state.isPaused` is true the server accepts motion batches but awards 0 XP and does not advance the moving-average window. Scores resume from the same level when the session is unpaused.
 
 ---
 
