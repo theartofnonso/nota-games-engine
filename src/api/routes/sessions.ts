@@ -9,6 +9,8 @@ import {
   getOrCreateSession,
   registerPlayer,
   removePlayer,
+  setTeam,
+  getTeamRecord,
 } from '../../sessions/session-registry.js';
 import { PlayerMotionBatchSchema } from '../../types/motion.js';
 import { validate, validateUUIDParam } from '../middleware/validate.js';
@@ -104,10 +106,13 @@ sessionsRouter.post(
       const { data: teams } = await supabase
         .schema('nota_games')
         .from('teams')
-        .select('id')
+        .select('id, name, color')
         .eq('session_id', sessionId);
 
       if (teams && teams.length > 0) {
+        // Cache all team details while we have them
+        for (const t of teams) setTeam(sessionId, t.id, t.name, t.color);
+
         // Count current members per team to find the smallest
         const { data: members } = await supabase
           .schema('nota_games')
@@ -135,6 +140,17 @@ sessionsRouter.post(
       }
     }
 
+    // On re-join, team details may not be in the registry yet — fetch and cache if missing
+    if (teamId && !getTeamRecord(sessionId, teamId)) {
+      const { data: teamData } = await supabase
+        .schema('nota_games')
+        .from('teams')
+        .select('name, color')
+        .eq('id', teamId)
+        .single();
+      if (teamData) setTeam(sessionId, teamId, teamData.name, teamData.color);
+    }
+
     // Cache player metadata in session registry (idempotent — safe on re-join)
     registerPlayer(sessionId, playerId, participant.player_name, teamId);
 
@@ -159,11 +175,15 @@ sessionsRouter.post(
         });
     }
 
+    const teamRecord = teamId ? getTeamRecord(sessionId, teamId) : undefined;
+
     res.status(200).json({
       sessionId,
       playerId,
       playerName: participant.player_name,
-      teamId:     teamId ?? null,
+      team: teamId
+        ? { id: teamId, name: teamRecord?.name ?? null, color: teamRecord?.color ?? null }
+        : null,
       isRejoin,
       gameState:  sessionRecord.gameState ?? null,
     });

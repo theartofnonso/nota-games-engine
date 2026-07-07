@@ -108,7 +108,15 @@ export async function scoreAndBroadcast(
   }));
 
   const teams: TeamScore[] = Array.from(teamTotals.entries())
-    .map(([teamId, totalXp]) => ({ teamId, totalXp: Math.round(totalXp * scale) }))
+    .map(([teamId, totalXp]) => {
+      const teamRecord = session.teams.get(teamId);
+      return {
+        teamId,
+        name:    teamRecord?.name  ?? 'Unknown',
+        color:   teamRecord?.color ?? '#6B7280',
+        totalXp: Math.round(totalXp * scale),
+      };
+    })
     .sort((a, b) => b.totalXp - a.totalXp);
 
   const scoresPayload: ScoresBroadcastPayload = {

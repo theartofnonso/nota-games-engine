@@ -40,7 +40,9 @@ export interface ScoredBatch {
 }
 
 export interface TeamScore {
-  teamId: string;
+  teamId:  string;
+  name:    string;
+  color:   string;
   totalXp: number;
 }
 

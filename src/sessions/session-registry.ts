@@ -2,10 +2,16 @@ import { SessionEngine } from '../game/session-engine.js';
 import type { RuntimeGameState } from '../types/session.js';
 import { supabase } from '../lib/supabase.js';
 
+export interface TeamRecord {
+  name:  string;
+  color: string;
+}
+
 interface SessionRecord {
   engine:          SessionEngine;
   gameState:       RuntimeGameState | null;
   players:         Map<string, { playerName: string; teamId?: string }>;
+  teams:           Map<string, TeamRecord>;
   scoresChannel:   ReturnType<typeof supabase.channel> | null;
   stateChannel:    ReturnType<typeof supabase.channel> | null;
   presenceChannel: ReturnType<typeof supabase.channel> | null;
@@ -19,6 +25,7 @@ export function getOrCreateSession(sessionId: string): SessionRecord {
       engine:          new SessionEngine(),
       gameState:       null,
       players:         new Map(),
+      teams:           new Map(),
       scoresChannel:   null,
       stateChannel:    null,
       presenceChannel: null,
@@ -44,6 +51,14 @@ export function registerPlayer(
 ): void {
   const session = getOrCreateSession(sessionId);
   session.players.set(playerId, { playerName, teamId });
+}
+
+export function setTeam(sessionId: string, teamId: string, name: string, color: string): void {
+  getOrCreateSession(sessionId).teams.set(teamId, { name, color });
+}
+
+export function getTeamRecord(sessionId: string, teamId: string): TeamRecord | undefined {
+  return sessions.get(sessionId)?.teams.get(teamId);
 }
 
 export function removePlayer(sessionId: string, playerId: string): void {

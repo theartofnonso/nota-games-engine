@@ -66,8 +66,8 @@ dashboardRouter.post(
       .schema('nota_games')
       .from('teams')
       .insert([
-        { session_id: data.id, name: 'Red'  },
-        { session_id: data.id, name: 'Blue' },
+        { session_id: data.id, name: 'Red',  color: '#EF4444' },
+        { session_id: data.id, name: 'Blue', color: '#3B82F6' },
       ]);
 
     if (teamsError) {
